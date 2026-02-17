@@ -1,8 +1,7 @@
-# HEAN SYMBIONT X - Docker Image
+# HEAN API - Docker Image (uv workspace)
 
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
 # Install system dependencies
@@ -10,25 +9,40 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (for better caching)
-COPY requirements.txt .
+# Install external Python dependencies (cached layer)
+RUN pip install --no-cache-dir \
+    pydantic>=2.0.0 \
+    pydantic-settings>=2.0.0 \
+    aiohttp>=3.9.0 \
+    websockets>=12.0 \
+    httpx>=0.25.0 \
+    redis>=5.0.0 \
+    orjson>=3.9.0 \
+    python-dotenv>=1.0.0 \
+    numpy>=1.24.0 \
+    networkx>=3.2.0 \
+    psutil>=5.9.0 \
+    fastapi>=0.104.0 \
+    "uvicorn[standard]>=0.24.0" \
+    slowapi>=0.1.9 \
+    prometheus-client>=0.19.0 \
+    duckdb>=1.0.0 \
+    polars>=0.20.0 \
+    pyarrow>=15.0.0 \
+    python-socketio>=5.10.0
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy source code
-COPY src/ ./src/
-COPY examples/ ./examples/
-COPY backend.env .env
+# Copy workspace packages
+COPY packages/ ./packages/
 
 # Create data directories
-RUN mkdir -p /app/data/symbiont_data
+RUN mkdir -p /app/data /app/logs
 
-# Set environment variables
-ENV PYTHONPATH=/app/src
+# PYTHONPATH: all workspace package src dirs for namespace resolution
+ENV PYTHONPATH="/app/packages/hean-core/src:/app/packages/hean-exchange/src:/app/packages/hean-portfolio/src:/app/packages/hean-risk/src:/app/packages/hean-execution/src:/app/packages/hean-strategies/src:/app/packages/hean-physics/src:/app/packages/hean-intelligence/src:/app/packages/hean-observability/src:/app/packages/hean-symbiont/src:/app/packages/hean-api/src:/app/packages/hean-app/src"
 ENV PYTHONUNBUFFERED=1
 
-# Default command (can be overridden)
-CMD ["python", "-c", "from hean.symbiont_x import HEANSymbiontX; print('HEAN SYMBIONT X - Docker image ready')"]
+# Default command
+CMD ["uvicorn", "hean.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

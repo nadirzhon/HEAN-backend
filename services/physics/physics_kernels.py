@@ -87,8 +87,12 @@ def _maybe_import_cpp():
         return None
 
     # Local repo module location when built via cpp_core install target.
-    repo_root = Path(__file__).resolve().parents[2]
-    cpp_module_dir = repo_root / "src" / "hean" / "cpp_modules"
+    resolved = Path(__file__).resolve()
+    if len(resolved.parents) > 2:
+        repo_root = resolved.parents[2]
+        cpp_module_dir = repo_root / "src" / "hean" / "cpp_modules"
+    else:
+        cpp_module_dir = Path("/nonexistent")
     if cpp_module_dir.exists():
         module_path = str(cpp_module_dir)
         if module_path not in sys.path:

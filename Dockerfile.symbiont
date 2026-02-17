@@ -1,8 +1,7 @@
-# HEAN SYMBIONT X - Docker Image for Testing
+# HEAN SYMBIONT X - Docker Image for Testing (uv workspace)
 
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
 # Install system dependencies
@@ -13,36 +12,36 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (for better caching)
-COPY requirements.txt .
+# Install external Python dependencies (cached layer)
+RUN pip install --no-cache-dir \
+    pydantic>=2.0.0 \
+    pydantic-settings>=2.0.0 \
+    aiohttp>=3.9.0 \
+    websockets>=12.0 \
+    redis>=5.0.0 \
+    orjson>=3.9.0 \
+    python-dotenv>=1.0.0 \
+    numpy>=1.24.0 \
+    networkx>=3.2.0 \
+    psutil>=5.9.0 \
+    pytest \
+    pytest-asyncio \
+    pytest-cov
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install additional testing dependencies
-RUN pip install --no-cache-dir pytest pytest-asyncio pytest-cov
-
-# Copy source code
-COPY src/ ./src/
+# Copy workspace packages and test files
+COPY packages/ ./packages/
 COPY examples/ ./examples/
 COPY scripts/ ./scripts/
 COPY tests/ ./tests/
 COPY simple_test.py .
 COPY test_symbiont.py .
-
-# Copy environment configuration
 COPY .env.symbiont .env
 
 # Create data directories
-RUN mkdir -p /app/data/historical
-RUN mkdir -p /app/logs
+RUN mkdir -p /app/data/historical /app/logs
 
-# Set environment variables
-ENV PYTHONPATH=/app/src
+# PYTHONPATH: all workspace package src dirs for namespace resolution
+ENV PYTHONPATH="/app/packages/hean-core/src:/app/packages/hean-exchange/src:/app/packages/hean-portfolio/src:/app/packages/hean-risk/src:/app/packages/hean-execution/src:/app/packages/hean-strategies/src:/app/packages/hean-physics/src:/app/packages/hean-intelligence/src:/app/packages/hean-observability/src:/app/packages/hean-symbiont/src:/app/packages/hean-api/src:/app/packages/hean-app/src"
 ENV PYTHONUNBUFFERED=1
 
-# Make scripts executable
-RUN chmod +x scripts/symbiont_x/*.py
-
-# Default command
 CMD ["python", "simple_test.py"]

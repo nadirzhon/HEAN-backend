@@ -79,7 +79,9 @@ def test_fix_016_signal_handlers():
     print("=== Testing FIX-016: Graceful Shutdown ===")
 
     # Read main.py and check for signal handling
-    with open("/Users/macbookpro/Desktop/HEAN/src/hean/main.py", "r") as f:
+    import pathlib
+    main_py = pathlib.Path(__file__).parent.parent / "packages" / "hean-app" / "src" / "hean" / "main.py"
+    with open(main_py, "r") as f:
         content = f.read()
 
     # Check for signal imports

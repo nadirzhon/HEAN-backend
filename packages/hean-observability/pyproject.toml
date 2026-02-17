@@ -1,0 +1,17 @@
+[project]
+name = "hean-observability"
+version = "2.0.0"
+description = "HEAN Observability — Monitoring, metrics, DuckDB storage"
+requires-python = ">=3.11"
+dependencies = [
+    "hean-core",
+    "prometheus-client>=0.19.0",
+    "duckdb>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hean"]
