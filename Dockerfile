@@ -44,5 +44,8 @@ RUN mkdir -p /app/data /app/logs
 ENV PYTHONPATH="/app/packages/hean-core/src:/app/packages/hean-exchange/src:/app/packages/hean-portfolio/src:/app/packages/hean-risk/src:/app/packages/hean-execution/src:/app/packages/hean-strategies/src:/app/packages/hean-physics/src:/app/packages/hean-intelligence/src:/app/packages/hean-observability/src:/app/packages/hean-symbiont/src:/app/packages/hean-api/src:/app/packages/hean-app/src"
 ENV PYTHONUNBUFFERED=1
 
-# Default command
-CMD ["uvicorn", "hean.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# CRITICAL: workers=1 — TradingSystem uses in-process shared state (EventBus, accounting,
+# killswitch). Multiple workers would create independent TradingSystem instances (split-brain):
+# API queries worker-1 while trading happens in worker-2, showing stale positions/equity.
+# For horizontal scaling, deploy multiple containers (not multiple workers per container).
+CMD ["uvicorn", "hean.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

@@ -85,7 +85,9 @@ class RiskSentinel:
         self._multi_level_protection = multi_level_protection
         self._strategy_allocator = strategy_allocator
         self._capital_preservation = capital_preservation
-        self._stop_trading_flag = stop_trading_flag
+        # _stop_trading_flag kept for backward compat but is now ignored.
+        # RiskSentinel subscribes to STOP_TRADING event for reliable state updates.
+        self._stop_trading = False  # updated via event subscription
 
         # Debouncing
         self._interval_sec = settings.risk_sentinel_update_interval_ms / 1000.0
@@ -120,6 +122,9 @@ class RiskSentinel:
         self._bus.subscribe(EventType.ORDER_CANCELLED, self._on_position_change)
         self._bus.subscribe(EventType.KILLSWITCH_TRIGGERED, self._on_position_change)
         self._bus.subscribe(EventType.KILLSWITCH_RESET, self._on_position_change)
+        # Fix: subscribe to STOP_TRADING so _stop_trading flag updates reliably
+        # (passing a bool to __init__ copies it by value — Python bool is immutable)
+        self._bus.subscribe(EventType.STOP_TRADING, self._on_stop_trading)
 
         # Compute initial envelope
         await self._recompute_and_publish()
@@ -135,6 +140,7 @@ class RiskSentinel:
         self._bus.unsubscribe(EventType.ORDER_CANCELLED, self._on_position_change)
         self._bus.unsubscribe(EventType.KILLSWITCH_TRIGGERED, self._on_position_change)
         self._bus.unsubscribe(EventType.KILLSWITCH_RESET, self._on_position_change)
+        self._bus.unsubscribe(EventType.STOP_TRADING, self._on_stop_trading)
         logger.info("RiskSentinel stopped")
 
     def get_envelope(self) -> RiskEnvelope | None:
@@ -154,6 +160,23 @@ class RiskSentinel:
         """Immediate recompute on position/order changes (critical state changes)."""
         if not self._running:
             return
+        await self._recompute_and_publish()
+
+    async def _on_stop_trading(self, event: Event) -> None:
+        """Handle STOP_TRADING event — set internal flag and force envelope recompute.
+
+        This is the event-driven replacement for the boolean flag snapshot pattern.
+        Python bool is immutable — passing it to __init__ copies the value, so
+        subsequent assignments in TradingSystem are never seen by the sentinel.
+        """
+        if not self._running:
+            return
+        self._stop_trading = True
+        logger.warning(
+            "[RiskSentinel] STOP_TRADING received — setting trading_allowed=False in all envelopes. "
+            "Reason: %s",
+            event.data.get("reason", "unknown"),
+        )
         await self._recompute_and_publish()
 
     async def _recompute_and_publish(self) -> None:
@@ -187,8 +210,8 @@ class RiskSentinel:
         trading_allowed = True
         risk_state = "NORMAL"
 
-        # Stop trading flag
-        if self._stop_trading_flag:
+        # Stop trading flag (event-driven — set by _on_stop_trading handler)
+        if self._stop_trading:
             trading_allowed = False
 
         # KillSwitch

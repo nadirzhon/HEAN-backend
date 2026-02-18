@@ -116,7 +116,7 @@ class PhysicsSignalFilter:
 
         # Rule 1: Block if phase confidence too low
         if phase_confidence < 0.5:
-            self._block_signal(
+            await self._block_signal(
                 signal,
                 "low_phase_confidence",
                 f"Phase confidence {phase_confidence:.2f} < 0.5",
@@ -125,7 +125,7 @@ class PhysicsSignalFilter:
 
         # Rule 2: Block in extreme chaos (high temp + high entropy)
         if temperature > 0.75 and entropy > 0.75:
-            self._block_signal(
+            await self._block_signal(
                 signal,
                 "extreme_chaos",
                 f"Extreme chaos: temp={temperature:.2f}, entropy={entropy:.2f}",
@@ -135,7 +135,7 @@ class PhysicsSignalFilter:
         # Rule 3: Block if signal direction conflicts with phase
         if self._is_phase_conflict(side, phase):
             if self._strict:
-                self._block_signal(
+                await self._block_signal(
                     signal,
                     "phase_conflict",
                     f"{side} signal conflicts with {phase} phase",
@@ -152,7 +152,7 @@ class PhysicsSignalFilter:
 
         # Rule 4: Block in extreme conditions
         if temperature > 0.85:
-            self._block_signal(
+            await self._block_signal(
                 signal,
                 "extreme_temperature",
                 f"Extreme temperature {temperature:.2f} > 0.85",
@@ -160,7 +160,7 @@ class PhysicsSignalFilter:
             return
 
         if entropy > 0.90:
-            self._block_signal(
+            await self._block_signal(
                 signal,
                 "extreme_entropy",
                 f"Extreme entropy {entropy:.2f} > 0.90",
@@ -201,7 +201,7 @@ class PhysicsSignalFilter:
 
         return False
 
-    def _block_signal(self, signal, reason: str, details: str) -> None:
+    async def _block_signal(self, signal, reason: str, details: str) -> None:
         """Block a signal and publish ORDER_DECISION with rejection reason."""
         self._stats["signals_blocked"] += 1
         self._stats["block_reasons"][reason] += 1
@@ -222,7 +222,7 @@ class PhysicsSignalFilter:
             "signal_id": signal.metadata.get("signal_id", "unknown"),
         }
 
-        self._bus.publish(
+        await self._bus.publish(
             Event(
                 event_type=EventType.ORDER_DECISION,
                 data=decision_data,

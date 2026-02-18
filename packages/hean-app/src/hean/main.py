@@ -885,13 +885,18 @@ class TradingSystem:
                 from hean.symbiont_x.bridge import SymbiontXBridge
                 self._symbiont_x_bridge = SymbiontXBridge(
                     bus=self._bus,
+                    enabled=True,  # must be True — checked above via settings.symbiont_x_enabled
                     generations=settings.symbiont_x_generations,
                     population_size=settings.symbiont_x_population_size,
                     mutation_rate=settings.symbiont_x_mutation_rate,
                     reoptimize_interval=settings.symbiont_x_reoptimize_interval,
                 )
-                await self._symbiont_x_bridge.start()
-                logger.info(f"Symbiont X GA Bridge started (pop={settings.symbiont_x_population_size}, gens={settings.symbiont_x_generations})")
+                await self._symbiont_x_bridge.start(strategy_configs={})
+                logger.info(
+                    "Symbiont X GA Bridge started (pop=%d, gens=%d)",
+                    settings.symbiont_x_population_size,
+                    settings.symbiont_x_generations,
+                )
             except Exception as e:
                 logger.warning(f"Symbiont X Bridge failed to start: {e}")
 

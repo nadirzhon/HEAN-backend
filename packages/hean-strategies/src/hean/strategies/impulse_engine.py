@@ -1077,6 +1077,19 @@ class ImpulseEngine(BaseStrategy):
                     logger.warning(f"[OFI] Failed to check order flow: {e}")
             # ============ END OFI FILTER ============
 
+            # Defence-in-depth: cap signal-level size multiplier before it enters
+            # the risk pipeline. PositionSizer has MAX_TOTAL_MULTIPLIER=3.0 downstream,
+            # but capping here prevents MTF×volatility stacking from inflating metadata.
+            _MAX_SIGNAL_SIZE_MULT = 2.5
+            if size_multiplier > _MAX_SIGNAL_SIZE_MULT:
+                logger.warning(
+                    "Size multiplier %.2fx exceeds signal cap %.1fx for %s — clamping",
+                    size_multiplier,
+                    _MAX_SIGNAL_SIZE_MULT,
+                    symbol,
+                )
+                size_multiplier = _MAX_SIGNAL_SIZE_MULT
+
             # Tight stop and take profit (Phase 1 Optimization: 0.3% SL, 1.5% TP)
             # OLD: SL=0.5%, TP=1.0% (R:R = 1:2)
             # NEW: SL=0.3%, TP=1.5% (R:R = 1:5) → +3.4x expected value per trade
@@ -1223,8 +1236,21 @@ class ImpulseEngine(BaseStrategy):
             # ------------------------------------------------------------------
             # EDGE CONFIRMATION LOOP (2-step entry)
             # ------------------------------------------------------------------
-            # Require confirmation for higher quality signals (2-step entry)
-            confirmed_signal = self._edge_confirmation.confirm(signal, tick)
+            # Require confirmation for higher quality signals (2-step entry).
+            # Pass full market context so the loop can check spread tightening,
+            # volatility expansion, and micro-pullback-then-resume conditions.
+            edge_context: dict = {
+                "spread_bps": spread_bps,
+                "vol_short": vol_short,
+                "vol_long": vol_long,
+                "return_pct": return_pct,
+            }
+            confirmed_signal = self._edge_confirmation.confirm_or_update(
+                signal,
+                tick,
+                edge_context,
+                list(self._price_history.get(symbol, [])),
+            )
 
             if confirmed_signal is None:
                 # First qualifying impulse becomes a candidate; require

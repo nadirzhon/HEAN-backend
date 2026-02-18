@@ -267,15 +267,31 @@ class PositionReconciler:
             actions.append(f"grace_period_skip:{missing_locally}")
 
         # Handle positions missing on exchange (ghost positions locally)
-        # These can be auto-cleaned
+        # These can be auto-cleaned — MUST publish POSITION_CLOSED so downstream
+        # observers (iOS, WebSocket, RiskLimits, DecisionMemory) are notified.
         if missing_on_exchange:
             for symbol in missing_on_exchange:
-                logger.warning(f"Removing ghost position (not on exchange): {symbol}")
-                # Find and remove the position
                 local_positions = self._accounting.get_positions()
                 for pos in local_positions:
                     if pos.symbol == symbol:
+                        logger.warning(
+                            "[Reconciler] Removing ghost position %s (%s) — not found on exchange. "
+                            "entry_price=%.4f, size=%.6f. Likely closed externally.",
+                            pos.position_id, symbol, pos.entry_price, pos.size,
+                        )
                         self._accounting.remove_position(pos.position_id)
+                        # Publish POSITION_CLOSED so all observers stay consistent
+                        await self._bus.publish(
+                            Event(
+                                event_type=EventType.POSITION_CLOSED,
+                                data={
+                                    "position": pos,
+                                    "reason": "reconciliation_ghost_cleanup",
+                                    "pnl": 0.0,
+                                    "note": "Position existed locally but not on exchange — likely closed externally",
+                                },
+                            )
+                        )
                         break
             actions.append(f"removed_ghost:{missing_on_exchange}")
 

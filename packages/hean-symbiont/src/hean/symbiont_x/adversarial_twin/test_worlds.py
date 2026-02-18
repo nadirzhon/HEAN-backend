@@ -164,15 +164,19 @@ class ReplayWorld(TestWorld):
 
     def run_test(self, strategy_config: dict, duration_seconds: int = 3600) -> TestResult:
         """
-        Запускает bacкtest на исторических данных
+        Запускает backtest на исторических данных через BacktestEngine.
 
         Args:
-            strategy_config: Конфигурация стратегии
-            duration_seconds: Сколько секунд истории проиграть
+            strategy_config: Конфигурация стратегии. Ожидает ключи:
+                - strategy_id / strategy_name: идентификаторы
+                - _genome: объект StrategyGenome для бэктеста
+                - _historical_data: список OHLCV-свечей [{timestamp, open, high, low, close, volume}]
+            duration_seconds: не используется (данные берутся из _historical_data)
 
         Returns:
-            TestResult
+            TestResult с реальными метриками
         """
+        from hean.symbiont_x.backtesting.backtest_engine import BacktestConfig, BacktestEngine
 
         self.reset()
         self.start_time_ns = time.time_ns()
@@ -180,40 +184,112 @@ class ReplayWorld(TestWorld):
         strategy_id = strategy_config.get('strategy_id', 'unknown')
         strategy_name = strategy_config.get('name', 'unknown')
 
-        # HONEST IMPLEMENTATION: Backtest logic not yet implemented
-        # Return honest zero results so evolution engine knows not to promote untested strategies
+        genome = strategy_config.get('_genome')
+        historical_data: list[dict] = strategy_config.get('_historical_data', [])
 
-        self.end_time_ns = time.time_ns()
-        duration = (self.end_time_ns - self.start_time_ns) / 1e9
+        if genome is None or len(historical_data) < 20:
+            self.end_time_ns = time.time_ns()
+            return TestResult(
+                world_type=WorldType.REPLAY,
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                total_trades=0, winning_trades=0, losing_trades=0, win_rate=0.0,
+                total_pnl=0.0, total_pnl_pct=0.0, max_drawdown=0.0, max_drawdown_pct=0.0,
+                sharpe_ratio=0.0, sortino_ratio=0.0, profit_factor=0.0,
+                max_position_size=0.0, max_leverage_used=1.0, risk_violations=0,
+                avg_slippage_bps=self.slippage_bps, avg_execution_time_ms=0.0, failed_orders=0,
+                start_time_ns=self.start_time_ns, end_time_ns=time.time_ns(),
+                duration_seconds=0.0, passed=False,
+                failure_reason="No genome or insufficient historical data (need >= 20 candles)",
+            )
 
-        return TestResult(
-            world_type=WorldType.REPLAY,
-            strategy_id=strategy_id,
-            strategy_name=strategy_name,
-            total_trades=0,
-            winning_trades=0,
-            losing_trades=0,
-            win_rate=0.0,
-            total_pnl=0.0,
-            total_pnl_pct=0.0,
-            max_drawdown=0.0,
-            max_drawdown_pct=0.0,
-            sharpe_ratio=0.0,
-            sortino_ratio=0.0,
-            profit_factor=0.0,
-            max_position_size=0.0,
-            max_leverage_used=0.0,
-            risk_violations=0,
-            avg_slippage_bps=0.0,
-            avg_execution_time_ms=0.0,
-            failed_orders=0,
-            start_time_ns=self.start_time_ns,
-            end_time_ns=self.end_time_ns,
-            duration_seconds=duration,
-            passed=False,
-            failure_reason="Backtest logic not yet implemented",
-            metrics={'is_not_implemented': True, 'implementation_status': 'stub'}
-        )
+        try:
+            config = BacktestConfig(
+                initial_capital=self.initial_capital,
+                commission_pct=self.commission_bps / 10000,
+                slippage_pct=self.slippage_bps / 10000,
+            )
+            engine = BacktestEngine(config)
+            result = engine.run_backtest(genome, historical_data)
+
+            # Profit factor: gross_wins / gross_losses
+            gross_wins = sum(t.pnl for t in result.trades if t.pnl is not None and t.pnl > 0)
+            gross_losses = abs(sum(t.pnl for t in result.trades if t.pnl is not None and t.pnl <= 0))
+            profit_factor = gross_wins / gross_losses if gross_losses > 0 else (1.5 if gross_wins > 0 else 0.0)
+
+            # Estimate max position size from genome
+            max_pos_gene = genome.get_gene(None, 'position_size_pct') if hasattr(genome, 'get_gene') else None
+            max_position_pct = max_pos_gene.value if max_pos_gene else 10.0
+
+            # Pass criteria: ≥5 trades, win_rate ≥ 30%, max_drawdown ≤ 30%
+            passed = (
+                result.total_trades >= 5
+                and result.win_rate >= 0.30
+                and result.max_drawdown_pct <= 30.0
+            )
+            failure_reason = None
+            if not passed:
+                reasons = []
+                if result.total_trades < 5:
+                    reasons.append(f"too few trades ({result.total_trades})")
+                if result.win_rate < 0.30:
+                    reasons.append(f"low win rate ({result.win_rate:.1%})")
+                if result.max_drawdown_pct > 30.0:
+                    reasons.append(f"high drawdown ({result.max_drawdown_pct:.1f}%)")
+                failure_reason = "; ".join(reasons)
+
+            self.end_time_ns = time.time_ns()
+            duration = (self.end_time_ns - self.start_time_ns) / 1e9
+
+            return TestResult(
+                world_type=WorldType.REPLAY,
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                total_trades=result.total_trades,
+                winning_trades=result.winning_trades,
+                losing_trades=result.losing_trades,
+                win_rate=result.win_rate,
+                total_pnl=result.total_return,
+                total_pnl_pct=result.return_pct,
+                max_drawdown=result.max_drawdown,
+                max_drawdown_pct=-abs(result.max_drawdown_pct),  # negative convention
+                sharpe_ratio=result.sharpe_ratio,
+                sortino_ratio=result.sharpe_ratio,  # approx (no downside std here)
+                profit_factor=profit_factor,
+                max_position_size=self.initial_capital * max_position_pct / 100.0,
+                max_leverage_used=1.0,
+                risk_violations=0,
+                avg_slippage_bps=self.slippage_bps,
+                avg_execution_time_ms=0.0,
+                failed_orders=0,
+                start_time_ns=self.start_time_ns,
+                end_time_ns=self.end_time_ns,
+                duration_seconds=duration,
+                passed=passed,
+                failure_reason=failure_reason,
+                metrics={
+                    'return_pct': result.return_pct,
+                    'final_capital': result.final_capital,
+                    'equity_curve_length': len(result.equity_curve),
+                },
+            )
+
+        except Exception as exc:
+            self.end_time_ns = time.time_ns()
+            duration = (self.end_time_ns - self.start_time_ns) / 1e9
+            return TestResult(
+                world_type=WorldType.REPLAY,
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                total_trades=0, winning_trades=0, losing_trades=0, win_rate=0.0,
+                total_pnl=0.0, total_pnl_pct=0.0, max_drawdown=0.0, max_drawdown_pct=0.0,
+                sharpe_ratio=0.0, sortino_ratio=0.0, profit_factor=0.0,
+                max_position_size=0.0, max_leverage_used=1.0, risk_violations=0,
+                avg_slippage_bps=self.slippage_bps, avg_execution_time_ms=0.0, failed_orders=0,
+                start_time_ns=self.start_time_ns, end_time_ns=self.end_time_ns,
+                duration_seconds=duration, passed=False,
+                failure_reason=f"BacktestEngine error: {exc}",
+            )
 
     def place_order(self, order: dict) -> dict:
         """Симулирует размещение ордера"""

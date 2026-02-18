@@ -427,15 +427,19 @@ class ExecutionRouter:
     def _generate_idempotency_key(self, order_request: OrderRequest) -> str:
         """Generate idempotency key for an order request.
 
-        Key is based on: signal_id + strategy_id + symbol + side + size (rounded)
-        This ensures the same signal doesn't create duplicate orders.
+        Key is based on: signal_id + strategy_id + symbol + side.
+        Size is intentionally excluded — it is a derived quantity that can be
+        adjusted downstream (OFI multiplier, position sizer scaling). Including
+        size would mean two adjusted-size requests for the SAME signal get
+        different keys and both execute, defeating the purpose of idempotency.
+        signal_id is globally unique per signal generation and is sufficient
+        for uniqueness guarantees.
         """
         key_parts = [
             order_request.signal_id,
             order_request.strategy_id,
             order_request.symbol,
             order_request.side,
-            f"{order_request.size:.6f}",  # Rounded to 6 decimals
         ]
         key_string = "|".join(key_parts)
         return hashlib.sha256(key_string.encode()).hexdigest()[:16]

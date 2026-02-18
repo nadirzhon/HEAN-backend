@@ -10,6 +10,7 @@ from collections.abc import Callable
 
 from .crossover import CrossoverEngine
 from .genome_types import StrategyGenome, create_random_genome
+from .multi_objective import IslandModel, ParetoRanker
 from .mutation_engine import MutationEngine
 
 
@@ -26,11 +27,17 @@ class EvolutionEngine:
         elite_size: int = 5,
         mutation_rate: float = 0.1,
         crossover_rate: float = 0.3,
+        use_pareto: bool = True,
+        use_island_model: bool = True,
+        n_islands: int = 5,
+        migration_interval: int = 10,
     ):
         self.population_size = population_size
         self.elite_size = elite_size
         self.mutation_rate = mutation_rate
         self.crossover_rate = crossover_rate
+        self.use_pareto = use_pareto
+        self.use_island_model = use_island_model
 
         # Population
         self.population: list[StrategyGenome] = []
@@ -39,6 +46,13 @@ class EvolutionEngine:
         # Engines
         self.mutation_engine = MutationEngine(base_mutation_rate=mutation_rate)
         self.crossover_engine = CrossoverEngine()
+
+        # Multi-objective GA components
+        self.pareto_ranker = ParetoRanker() if use_pareto else None
+        self.island_model = IslandModel(
+            n_islands=n_islands,
+            migration_interval=migration_interval,
+        ) if use_island_model else None
 
         # History
         self.generation_history = deque(maxlen=100)
@@ -50,19 +64,18 @@ class EvolutionEngine:
 
     def initialize_population(self, base_name: str = "Strategy") -> list[StrategyGenome]:
         """
-        Инициализирует начальную популяцию
-
-        Создаёт случайные геномы
+        Инициализирует начальную популяцию случайными геномами.
+        Если Island Model включена — распределяет по островам.
         """
-
-        self.population = []
-
-        for i in range(self.population_size):
-            genome = create_random_genome(f"{base_name}_{i}")
-            self.population.append(genome)
-
+        self.population = [
+            create_random_genome(f"{base_name}_{i}")
+            for i in range(self.population_size)
+        ]
         self.total_genomes_created += self.population_size
         self.generation_number = 0
+
+        if self.island_model is not None:
+            self.island_model.distribute_population(self.population)
 
         return self.population
 
@@ -80,25 +93,27 @@ class EvolutionEngine:
             Новая популяция
         """
 
+        # Island Model: перед эволюцией собираем популяцию со всех островов
+        if self.island_model is not None:
+            self.population = self.island_model.gather_population()
+
         # Evaluate fitness if not already done
         if fitness_evaluator:
             for genome in self.population:
                 if genome.fitness_score == 0:
                     genome.fitness_score = fitness_evaluator(genome)
 
-        # Selection - выбираем выживших
-        survivors = self._selection()
+        # Selection: Pareto-отбор (если включён) или стандартный
+        survivors = self._selection_pareto() if self.pareto_ranker else self._selection()
 
         # Elitism - сохраняем лучших без изменений
         elite = self._elitism(survivors)
 
-        # Reproduction - создаём новых
+        # Reproduction - создаём новых потомков
         offspring = self._reproduction(survivors)
 
         # Combine into new population
         new_population = elite + offspring
-
-        # Trim to population size
         new_population = new_population[:self.population_size]
 
         # Kill off old population that didn't make it
@@ -107,14 +122,22 @@ class EvolutionEngine:
         killed_ids = old_ids - new_ids
         self.total_genomes_killed += len(killed_ids)
 
-        # Update population
         self.population = new_population
         self.generation_number += 1
 
-        # Record generation stats
+        # Island Model: миграция и обновление
+        if self.island_model is not None:
+            if self.island_model.should_migrate(self.generation_number):
+                self.island_model.distribute_population(self.population)
+                n_migrated = self.island_model.migrate()
+                if n_migrated:
+                    self.population = self.island_model.gather_population()
+            else:
+                self.island_model.distribute_population(self.population)
+            self.island_model.update_island_stats()
+
         self._record_generation_stats()
 
-        # Update best genome ever
         best_current = max(self.population, key=lambda g: g.fitness_score)
         if self.best_genome_ever is None or best_current.fitness_score > self.best_genome_ever.fitness_score:
             self.best_genome_ever = best_current
@@ -148,6 +171,26 @@ class EvolutionEngine:
             survivors.extend(random_survivors)
 
         return survivors
+
+    def _selection_pareto(self) -> list[StrategyGenome]:
+        """
+        Pareto-отбор (NSGA-II crowded comparison).
+
+        Отбирает топ 70% популяции по Pareto-ранку + crowding distance,
+        плюс случайные 20% из нижней части для поддержания разнообразия.
+        """
+        n_top = int(self.population_size * 0.70)
+        n_random = int(self.population_size * 0.20)
+
+        pareto_selected = self.pareto_ranker.select_by_pareto(self.population, n_top)
+
+        remaining = [g for g in self.population if g not in pareto_selected]
+        if remaining and n_random > 0:
+            import random
+            random_extras = random.sample(remaining, min(n_random, len(remaining)))
+            pareto_selected.extend(random_extras)
+
+        return pareto_selected
 
     def _elitism(self, survivors: list[StrategyGenome]) -> list[StrategyGenome]:
         """
@@ -287,6 +330,13 @@ class EvolutionEngine:
         # Add generation history
         if self.generation_history:
             stats['generation_history'] = list(self.generation_history)
+
+        # Multi-objective stats
+        if self.pareto_ranker and self.population:
+            stats['pareto'] = self.pareto_ranker.get_statistics(self.population)
+
+        if self.island_model:
+            stats['island_model'] = self.island_model.get_statistics()
 
         return stats
 
