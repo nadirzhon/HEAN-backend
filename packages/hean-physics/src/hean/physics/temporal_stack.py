@@ -6,6 +6,12 @@ Analyzes markets across 5 time levels simultaneously:
 - LEVEL 3 TACTICS (minutes): Current situation and order flow
 - LEVEL 2 EXECUTION (seconds): Entry points and R:R
 - LEVEL 1 MICRO (milliseconds): Orderbook and slippage
+
+Improvements over v1:
+- order_flow_delta now updated via update_order_flow()
+- confidence calculated from actual data volume (not hardcoded)
+- update_spread() feeds real bid-ask for micro-level
+- get_dominant_signal() aggregates all 5 levels into one verdict
 """
 
 from collections import deque
@@ -62,7 +68,23 @@ class TemporalState:
 
 
 class TemporalStack:
-    """5-level temporal analysis engine."""
+    """5-level temporal analysis engine.
+
+    Data targets (ticks needed for full confidence):
+      MACRO:     2000 ticks (~200 min at 10 TPS)
+      SESSION:   600  ticks (~60 min)
+      TACTICS:   120  ticks (~12 min)
+      EXECUTION: 30   ticks (~3 min)
+      MICRO:     10   ticks (~1 min)
+    """
+
+    _TARGET_TICKS = {
+        TimeLevel.MACRO: 2000,
+        TimeLevel.SESSION: 600,
+        TimeLevel.TACTICS: 120,
+        TimeLevel.EXECUTION: 30,
+        TimeLevel.MICRO: 10,
+    }
 
     def __init__(self, symbols: list[str] | None = None):
         self.symbols = symbols or ["BTCUSDT"]
@@ -72,38 +94,76 @@ class TemporalStack:
         self._volume_history: dict[str, deque] = {
             s: deque(maxlen=1000) for s in self.symbols
         }
-        self._order_flow_delta: dict[str, float] = dict.fromkeys(self.symbols, 0.0)
-        self._states: dict[TimeLevel, TemporalState] = {}
-        self._last_update = datetime.utcnow()
+        # Order flow: cumulative USD delta per symbol (buy+ / sell-)
+        self._order_flow_cumulative: dict[str, float] = dict.fromkeys(self.symbols, 0.0)
+        # Short-window order flow delta (last N dollars)
+        self._order_flow_window: dict[str, deque[float]] = {
+            s: deque(maxlen=50) for s in self.symbols
+        }
+        # Latest bid-ask spread per symbol (for micro-level)
+        self._latest_spread: dict[str, float] = dict.fromkeys(self.symbols, 0.0)
+
+        self._states: dict[str, dict[TimeLevel, TemporalState]] = {}
+        self._last_update: dict[str, datetime] = {}
 
     def update(self, symbol: str, price: float, volume: float = 0.0) -> None:
         """Update with new tick data."""
         if symbol not in self._price_history:
             self._price_history[symbol] = deque(maxlen=10000)
             self._volume_history[symbol] = deque(maxlen=1000)
+            self._order_flow_cumulative[symbol] = 0.0
+            self._order_flow_window[symbol] = deque(maxlen=50)
+            self._latest_spread[symbol] = 0.0
 
         now = datetime.utcnow()
         self._price_history[symbol].append((now, price))
         self._volume_history[symbol].append((now, volume))
         self._analyze_levels(symbol)
-        self._last_update = now
+        self._last_update[symbol] = now
+
+    def update_order_flow(self, symbol: str, delta_usd: float) -> None:
+        """Feed signed order flow delta (positive = buy pressure, negative = sell).
+
+        Call this on each tick with: delta_usd = volume * price * (+1 for buy / -1 for sell)
+        """
+        if symbol not in self._order_flow_cumulative:
+            self._order_flow_cumulative[symbol] = 0.0
+            self._order_flow_window[symbol] = deque(maxlen=50)
+
+        self._order_flow_cumulative[symbol] += delta_usd
+        self._order_flow_window[symbol].append(delta_usd)
+
+    def update_spread(self, symbol: str, spread: float) -> None:
+        """Update latest bid-ask spread for micro-level analysis."""
+        self._latest_spread[symbol] = spread
 
     def _analyze_levels(self, symbol: str) -> None:
         prices = self._price_history[symbol]
-        if len(prices) < 10:
+        if len(prices) < 5:
             return
 
         price_values = np.array([p[1] for p in prices])
         current_price = price_values[-1]
 
-        self._states[TimeLevel.MACRO] = self._analyze_macro(symbol, price_values)
-        self._states[TimeLevel.SESSION] = self._analyze_session(symbol, price_values, current_price)
-        self._states[TimeLevel.TACTICS] = self._analyze_tactics(symbol, price_values, current_price)
-        self._states[TimeLevel.EXECUTION] = self._analyze_execution(symbol, price_values, current_price)
-        self._states[TimeLevel.MICRO] = self._analyze_micro(symbol, price_values, current_price)
+        if symbol not in self._states:
+            self._states[symbol] = {}
+
+        self._states[symbol][TimeLevel.MACRO] = self._analyze_macro(symbol, price_values)
+        self._states[symbol][TimeLevel.SESSION] = self._analyze_session(symbol, price_values, current_price)
+        self._states[symbol][TimeLevel.TACTICS] = self._analyze_tactics(symbol, price_values, current_price)
+        self._states[symbol][TimeLevel.EXECUTION] = self._analyze_execution(symbol, price_values, current_price)
+        self._states[symbol][TimeLevel.MICRO] = self._analyze_micro(symbol, price_values, current_price)
+
+    def _data_confidence(self, level: TimeLevel, n_ticks: int) -> float:
+        """Confidence from 0.0 to 1.0 based on how much data we have vs target."""
+        target = self._TARGET_TICKS[level]
+        return float(min(1.0, n_ticks / target))
 
     def _analyze_macro(self, symbol: str, prices: np.ndarray) -> TemporalState:
-        if len(prices) >= 200:
+        n = len(prices)
+        conf = self._data_confidence(TimeLevel.MACRO, n)
+
+        if n >= 200:
             ema = self._ema(prices, 200)
             current = prices[-1]
             if current > ema * 1.02:
@@ -112,7 +172,7 @@ class TemporalStack:
                 trend, force, phase = TrendDirection.BEARISH, "Distribution pressure", "trending"
             else:
                 trend, force, phase = TrendDirection.NEUTRAL, "Range-bound", "accumulation"
-        elif len(prices) >= 20:
+        elif n >= 20:
             ema = self._ema(prices, 20)
             current = prices[-1]
             if current > ema * 1.02:
@@ -128,16 +188,18 @@ class TemporalStack:
             level=TimeLevel.MACRO, name="MACRO", timeframe="days-weeks",
             trend=trend, phase=phase, dominant_force=force,
             summary=f"{symbol} {trend.value} trend, {phase} phase",
-            confidence=0.8,
+            confidence=conf,
         )
 
     def _analyze_session(self, symbol: str, prices: np.ndarray, current: float) -> TemporalState:
+        n = len(prices)
+        conf = self._data_confidence(TimeLevel.SESSION, n)
         hour = datetime.utcnow().hour
         session = "Asia" if hour < 8 else ("London" if hour < 16 else "New York")
 
-        if len(prices) >= 60:
+        if n >= 60:
             recent = prices[-60:]
-            range_pct = (np.max(recent) - np.min(recent)) / np.min(recent) * 100
+            range_pct = (np.max(recent) - np.min(recent)) / (np.min(recent) + 1e-10) * 100
             if range_pct > 2.0:
                 mode, strategy = "Breakout", "Momentum"
             elif range_pct < 0.5:
@@ -152,20 +214,33 @@ class TemporalStack:
             trend=TrendDirection.NEUTRAL, phase=mode.lower(),
             dominant_force=session,
             summary=f"{session} session: {mode} mode, use {strategy}",
-            confidence=0.7,
+            confidence=conf,
             details={"session": session, "mode": mode, "strategy": strategy},
         )
 
     def _analyze_tactics(self, symbol: str, prices: np.ndarray, current: float) -> TemporalState:
-        delta = self._order_flow_delta.get(symbol, 0.0)
+        n = len(prices)
+        conf = self._data_confidence(TimeLevel.TACTICS, n)
 
-        if len(prices) >= 20:
+        # Real order flow delta from window
+        flow_window = list(self._order_flow_window.get(symbol, deque()))
+        delta = sum(flow_window[-20:]) if flow_window else 0.0
+
+        # Infer trend from order flow direction
+        if delta > 0:
+            flow_trend = TrendDirection.BULLISH
+        elif delta < 0:
+            flow_trend = TrendDirection.BEARISH
+        else:
+            flow_trend = TrendDirection.NEUTRAL
+
+        if n >= 20:
             recent = prices[-20:]
             resistance = float(np.max(recent))
             support = float(np.min(recent))
-            if abs(current - resistance) / current < 0.002:
+            if abs(current - resistance) / (current + 1e-10) < 0.002:
                 situation = f"Testing resistance at {resistance:.2f}"
-            elif abs(current - support) / current < 0.002:
+            elif abs(current - support) / (current + 1e-10) < 0.002:
                 situation = f"Testing support at {support:.2f}"
             else:
                 situation = f"Mid-range {support:.2f}-{resistance:.2f}"
@@ -174,15 +249,18 @@ class TemporalStack:
 
         return TemporalState(
             level=TimeLevel.TACTICS, name="TACTICS", timeframe="minutes",
-            trend=TrendDirection.NEUTRAL, phase="analysis",
+            trend=flow_trend, phase="analysis",
             dominant_force="order_flow",
-            summary=f"{situation}. Flow: ${delta/1e6:.1f}M",
-            confidence=0.6,
-            details={"situation": situation, "order_flow_delta": delta},
+            summary=f"{situation}. Flow: ${delta / 1e6:.2f}M",
+            confidence=conf,
+            details={"situation": situation, "order_flow_delta_usd": delta},
         )
 
     def _analyze_execution(self, symbol: str, prices: np.ndarray, current: float) -> TemporalState:
-        if len(prices) >= 20:
+        n = len(prices)
+        conf = self._data_confidence(TimeLevel.EXECUTION, n)
+
+        if n >= 20:
             low = float(np.min(prices[-20:]))
             stop = low * 0.998
             risk = abs(current - stop)
@@ -190,20 +268,29 @@ class TemporalStack:
             rr = (tp - current) / risk if risk > 0 else 0
             summary = f"Entry: {current:.2f}, Stop: {stop:.2f}, R:R={rr:.1f}"
         else:
-            stop, tp, rr = current * 0.99, current * 1.02, 2.0
+            stop = current * 0.99
+            tp = current * 1.02
+            rr = 2.0
             summary = f"Entry: {current:.2f} (insufficient data)"
 
         return TemporalState(
             level=TimeLevel.EXECUTION, name="EXECUTION", timeframe="seconds",
             trend=TrendDirection.NEUTRAL, phase="ready",
-            dominant_force="technical", summary=summary, confidence=0.75,
+            dominant_force="technical", summary=summary, confidence=conf,
             details={"entry_price": current, "stop_loss": stop, "take_profit": tp, "rr_ratio": rr},
         )
 
     def _analyze_micro(self, symbol: str, prices: np.ndarray, current: float) -> TemporalState:
-        if len(prices) >= 10:
+        n = len(prices)
+        conf = self._data_confidence(TimeLevel.MICRO, n)
+
+        # Use real spread if available, fallback to price std
+        spread = self._latest_spread.get(symbol, 0.0)
+        if spread > 0:
+            slippage = (spread / current) * 100 if current > 0 else 0.02
+        elif n >= 10:
             vol = float(np.std(prices[-10:]))
-            slippage = (vol / current) * 100
+            slippage = (vol / current) * 100 if current > 0 else 0.02
         else:
             slippage = 0.02
 
@@ -215,8 +302,12 @@ class TemporalStack:
             trend=TrendDirection.NEUTRAL, phase="execution",
             dominant_force="orderbook",
             summary=f"{state}. {order_type} at {current:.2f}, slippage ~{slippage:.3f}%",
-            confidence=0.9,
-            details={"order_type": order_type, "slippage_pct": slippage},
+            confidence=conf,
+            details={
+                "order_type": order_type,
+                "slippage_pct": slippage,
+                "spread": spread,
+            },
         )
 
     def _ema(self, prices: np.ndarray, period: int) -> float:
@@ -229,14 +320,82 @@ class TemporalStack:
             ema = alpha * p + (1 - alpha) * ema
         return float(ema)
 
-    def get_state(self, level: TimeLevel) -> TemporalState | None:
-        return self._states.get(level)
+    # ── Dominant signal aggregation ───────────────────────────────────────────
 
-    def get_all_states(self) -> dict[TimeLevel, TemporalState]:
-        return self._states.copy()
+    def get_dominant_signal(self, symbol: str) -> dict[str, Any]:
+        """Aggregate all 5 temporal levels into a single directional verdict.
 
-    def get_stack_dict(self) -> dict[str, Any]:
-        return {
-            "levels": {str(level.value): s.to_dict() for level, s in self._states.items()},
-            "last_update": self._last_update.isoformat(),
+        Weights: MACRO=0.35, SESSION=0.15, TACTICS=0.25, EXECUTION=0.15, MICRO=0.10
+        Returns: {direction, score, confidence, details}
+        """
+        states = self._states.get(symbol, {})
+        if not states:
+            return {"direction": "neutral", "score": 0.0, "confidence": 0.0, "details": {}}
+
+        weights = {
+            TimeLevel.MACRO: 0.35,
+            TimeLevel.SESSION: 0.15,
+            TimeLevel.TACTICS: 0.25,
+            TimeLevel.EXECUTION: 0.15,
+            TimeLevel.MICRO: 0.10,
         }
+
+        direction_map = {
+            TrendDirection.BULLISH: +1.0,
+            TrendDirection.BEARISH: -1.0,
+            TrendDirection.NEUTRAL: 0.0,
+        }
+
+        weighted_score = 0.0
+        total_weight = 0.0
+        level_details: dict[str, str] = {}
+
+        for level, state in states.items():
+            w = weights.get(level, 0.0)
+            d = direction_map.get(state.trend, 0.0)
+            # Scale by level confidence and weight
+            weighted_score += d * w * state.confidence
+            total_weight += w * state.confidence
+            level_details[state.name] = state.trend.value
+
+        if total_weight == 0:
+            return {"direction": "neutral", "score": 0.0, "confidence": 0.0, "details": level_details}
+
+        score = weighted_score / total_weight
+        avg_conf = total_weight / sum(weights.values())
+
+        if score > 0.2:
+            direction = "bullish"
+        elif score < -0.2:
+            direction = "bearish"
+        else:
+            direction = "neutral"
+
+        return {
+            "direction": direction,
+            "score": round(score, 4),
+            "confidence": round(avg_conf, 4),
+            "details": level_details,
+        }
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def get_state(self, symbol: str, level: TimeLevel) -> TemporalState | None:
+        return self._states.get(symbol, {}).get(level)
+
+    def get_all_states(self, symbol: str) -> dict[TimeLevel, TemporalState]:
+        return self._states.get(symbol, {}).copy()
+
+    def get_stack_dict(self, symbol: str | None = None) -> dict[str, Any]:
+        if symbol:
+            states = self._states.get(symbol, {})
+            return {
+                "levels": {str(level.value): s.to_dict() for level, s in states.items()},
+                "last_update": self._last_update.get(symbol, datetime.utcnow()).isoformat(),
+                "dominant_signal": self.get_dominant_signal(symbol),
+            }
+        # Legacy: return first symbol
+        first = next(iter(self._states), None)
+        if first:
+            return self.get_stack_dict(first)
+        return {"levels": {}, "last_update": datetime.utcnow().isoformat()}

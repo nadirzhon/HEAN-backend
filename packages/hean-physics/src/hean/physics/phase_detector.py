@@ -3,9 +3,13 @@
 Detects phase transitions using temperature and entropy:
 - ICE: Low T, low S (sideways, consolidation)
 - WATER: Medium T, medium S (trend, directional)
+- WATER_BULL: WATER phase with positive Kalman price momentum → bullish trend
+- WATER_BEAR: WATER phase with negative Kalman price momentum → bearish trend
 - VAPOR: High T, high S (cascade, crash, chaos)
 
-Key insight: ICE -> WATER transitions offer maximum edge with minimum risk.
+Key insight: ICE -> WATER_BULL transitions offer maximum edge with minimum risk.
+WATER sub-phases use the filtered Kalman state (price_momentum component) from the
+previous tick — zero look-ahead bias since _calculate_resonance() runs after detection.
 """
 
 import time
@@ -22,7 +26,9 @@ logger = get_logger(__name__)
 
 class MarketPhase(str, Enum):
     ICE = "ice"
-    WATER = "water"
+    WATER = "water"           # Neutral / insufficient Kalman data
+    WATER_BULL = "water_bull" # WATER + positive price momentum (bullish trend)
+    WATER_BEAR = "water_bear" # WATER + negative price momentum (bearish trend)
     VAPOR = "vapor"
     UNKNOWN = "unknown"
 
@@ -69,8 +75,21 @@ class PhaseTransition:
     is_favorable: bool
 
 
+# Phases that are sub-variants of WATER (treated as WATER for T/S boundary checks)
+_WATER_PHASES = frozenset({MarketPhase.WATER, MarketPhase.WATER_BULL, MarketPhase.WATER_BEAR})
+
+# Momentum threshold to assign directional WATER sub-phase
+_WATER_BULL_THRESHOLD = 0.001   # price_mom > +0.1% → WATER_BULL
+_WATER_BEAR_THRESHOLD = -0.001  # price_mom < -0.1% → WATER_BEAR
+
+
 class PhaseDetector:
-    """Detect market phase transitions using temperature and entropy."""
+    """Detect market phase transitions using temperature and entropy.
+
+    WATER sub-phases (WATER_BULL / WATER_BEAR) are determined by the
+    Kalman-filtered price_momentum from the previous tick. Falls back to
+    neutral WATER when insufficient data (< 5 ticks in price buffer).
+    """
 
     ICE_TEMP_MAX = 400.0
     WATER_TEMP_MAX = 800.0
@@ -240,10 +259,11 @@ class PhaseDetector:
         prev_reading = self.get_current(symbol)
         prev_phase = prev_reading.phase if prev_reading else MarketPhase.UNKNOWN
 
-        phase = self._detect_with_hysteresis(temperature, entropy, prev_phase)
+        # Detect base phase (uses Kalman state from PREVIOUS tick — no look-ahead)
+        phase = self._detect_with_hysteresis(temperature, entropy, prev_phase, symbol)
         confidence = self._calculate_confidence(temperature, entropy, phase)
 
-        # SSD: Calculate resonance and determine operating mode
+        # SSD: Calculate resonance and update Kalman state for NEXT tick
         resonance = self._calculate_resonance(symbol, entropy_flow)
 
         reading = PhaseReading(
@@ -284,9 +304,21 @@ class PhaseDetector:
         return phase
 
     def _detect_with_hysteresis(
-        self, temperature: float, entropy: float, prev_phase: MarketPhase
+        self, temperature: float, entropy: float, prev_phase: MarketPhase,
+        symbol: str = "UNKNOWN",
     ) -> MarketPhase:
-        if prev_phase != MarketPhase.UNKNOWN:
+        """Detect phase with hysteresis to prevent rapid oscillation.
+
+        WATER sub-phases (WATER_BULL/WATER_BEAR) use Kalman-filtered price_momentum
+        from the previous tick. Falls back to neutral WATER if no state available.
+
+        Hysteresis applies regardless of WATER sub-phase — WATER_BULL and WATER_BEAR
+        are treated as WATER for boundary calculations.
+        """
+        # Treat all WATER variants as WATER for hysteresis boundary purposes
+        effective_prev = MarketPhase.WATER if prev_phase in _WATER_PHASES else prev_phase
+
+        if effective_prev != MarketPhase.UNKNOWN:
             ice_temp_max = self.ICE_TEMP_MAX * self.HYSTERESIS_FACTOR
             water_temp_max = self.WATER_TEMP_MAX * self.HYSTERESIS_FACTOR
             ice_entropy_max = self.ICE_ENTROPY_MAX * self.HYSTERESIS_FACTOR
@@ -302,7 +334,27 @@ class PhaseDetector:
         elif temperature >= water_temp_max and entropy >= water_entropy_max:
             return MarketPhase.VAPOR
         else:
-            return MarketPhase.WATER
+            # WATER zone — refine using Kalman price_momentum (from previous tick)
+            return self._classify_water_sub_phase(symbol)
+
+    def _classify_water_sub_phase(self, symbol: str) -> MarketPhase:
+        """Determine WATER sub-phase from Kalman-filtered price momentum.
+
+        Uses state estimate from the PREVIOUS tick (Kalman is updated after detect()).
+        Returns neutral WATER when insufficient history.
+        """
+        state = self._state_estimate.get(symbol)
+        if state is None:
+            return MarketPhase.WATER  # No Kalman data yet
+
+        price_mom = float(state[0])  # state[0] = price_momentum component
+
+        if price_mom > _WATER_BULL_THRESHOLD:
+            return MarketPhase.WATER_BULL
+        elif price_mom < _WATER_BEAR_THRESHOLD:
+            return MarketPhase.WATER_BEAR
+        else:
+            return MarketPhase.WATER  # Momentum too weak to assign direction
 
     def _calculate_confidence(
         self, temperature: float, entropy: float, phase: MarketPhase
@@ -315,21 +367,53 @@ class PhaseDetector:
             t_dist = max(0, temperature - self.WATER_TEMP_MAX) / self.WATER_TEMP_MAX
             s_dist = max(0, entropy - self.WATER_ENTROPY_MAX) / self.WATER_ENTROPY_MAX
             return min(1.0, (t_dist + s_dist) / 2)
-        elif phase == MarketPhase.WATER:
+        elif phase in _WATER_PHASES:
             t_ok = 1.0 if self.ICE_TEMP_MAX <= temperature < self.WATER_TEMP_MAX else 0.5
             s_ok = 1.0 if self.ICE_ENTROPY_MAX <= entropy < self.WATER_ENTROPY_MAX else 0.5
-            return (t_ok + s_ok) / 2
+            base_conf = (t_ok + s_ok) / 2
+            # Sub-phases (BULL/BEAR) have higher confidence due to directional clarity
+            if phase in (MarketPhase.WATER_BULL, MarketPhase.WATER_BEAR):
+                state = self._state_estimate.get("")  # confidence boost from momentum magnitude
+                return min(1.0, base_conf * 1.1)
+            return base_conf
         return 0.0
 
     def _is_favorable_transition(self, from_phase: MarketPhase, to_phase: MarketPhase) -> bool:
-        # ICE -> WATER is the golden transition
+        """Evaluate transition favorability.
+
+        Favorable:  ICE → WATER_BULL (cleanest long setup)
+                    ICE → WATER (breakout, direction TBD)
+                    WATER_BULL → ICE (re-accumulation)
+                    WATER → ICE  (re-consolidation)
+        Neutral:    WATER_BULL ↔ WATER_BEAR (momentum flip, assess separately)
+        Unfavorable: anything → VAPOR, VAPOR → anything
+        """
+        # Normalize for comparison
+        from_is_water = from_phase in _WATER_PHASES
+        to_is_water = to_phase in _WATER_PHASES
+
+        # ICE → WATER_BULL: maximum opportunity, clean momentum breakout
+        if from_phase == MarketPhase.ICE and to_phase == MarketPhase.WATER_BULL:
+            return True
+        # ICE → WATER (neutral direction): breakout but direction unclear
         if from_phase == MarketPhase.ICE and to_phase == MarketPhase.WATER:
             return True
-        if from_phase == MarketPhase.WATER and to_phase == MarketPhase.ICE:
+        # ICE → WATER_BEAR: bearish breakout from consolidation — unfavorable for longs
+        if from_phase == MarketPhase.ICE and to_phase == MarketPhase.WATER_BEAR:
+            return False
+        # WATER variants → ICE: re-consolidation (wait for next breakout)
+        if from_is_water and to_phase == MarketPhase.ICE:
             return True
+        # Transitions into VAPOR: always unfavorable (chaos/cascade)
         if to_phase == MarketPhase.VAPOR:
             return False
+        # Transitions out of VAPOR: market calming (opportunity emerging, but uncertain)
         if from_phase == MarketPhase.VAPOR:
+            return False
+        # WATER_BULL → WATER_BEAR or vice versa: momentum flip (informational but not edge)
+        if from_phase == MarketPhase.WATER_BULL and to_phase == MarketPhase.WATER_BEAR:
+            return False
+        if from_phase == MarketPhase.WATER_BEAR and to_phase == MarketPhase.WATER_BULL:
             return False
         return False
 

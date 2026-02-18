@@ -155,7 +155,7 @@ class ContextAggregator:
         ctx.components_updated["regime"] = datetime.utcnow()
 
     async def _on_context_update(self, event: Event) -> None:
-        """Обработать CONTEXT_UPDATE — backward compat + physics."""
+        """Обработать CONTEXT_UPDATE — backward compat + physics + oracle_weights."""
         data = event.data
         context_type = data.get("context_type")
 
@@ -180,6 +180,16 @@ class ContextAggregator:
                 size_multiplier=physics_data.get("size_multiplier", 1.0),
             )
             ctx.components_updated["physics"] = datetime.utcnow()
+
+        elif context_type == "oracle_weights":
+            # DynamicOracleWeightManager публикует динамические веса сигналов
+            symbol = data.get("symbol")
+            weights = data.get("weights")  # dict: tcn/finbert/ollama/brain → float
+            ctx = self._contexts.get(symbol) if symbol else None
+            if not ctx or not weights:
+                return
+            ctx.oracle_weights = weights
+            ctx.components_updated["oracle_weights"] = datetime.utcnow()
 
     async def _on_physics(self, event: Event) -> None:
         """Обработать PHYSICS_UPDATE (отдельный event type)."""

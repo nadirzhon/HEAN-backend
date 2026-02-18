@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import Any
 
@@ -140,7 +140,7 @@ class AICouncil:
             await asyncio.sleep(self._review_interval)
 
     async def _run_review_session(self) -> CouncilSession:
-        """Execute one complete review session."""
+        """Execute one complete review session with deliberation round."""
         session = CouncilSession()
 
         # 1. Collect system snapshot
@@ -156,21 +156,31 @@ class AICouncil:
         ]
         reviews = await asyncio.gather(*review_tasks, return_exceptions=True)
 
-        # 4. Process results
+        # 4. Collect all valid results first (without applying anything yet)
         for result in reviews:
             if isinstance(result, Exception):
                 logger.warning(f"Council member review failed: {result}")
                 continue
             if not isinstance(result, CouncilReview):
                 continue
-
             session.reviews.append(result)
-            for rec in result.recommendations:
+
+        # 5. Deliberation round: mark contested recommendations before auto-apply
+        contested_count = self._run_deliberation_round(session)
+        session.contested_count = contested_count
+        if contested_count > 0:
+            logger.warning(
+                f"Council deliberation: {contested_count} contested recommendation(s) "
+                f"found — will not auto-apply. Requires human review."
+            )
+
+        # 6. Auto-apply non-contested safe recommendations
+        for review in session.reviews:
+            for rec in review.recommendations:
                 self._all_recommendations.append(rec)
                 session.total_recommendations += 1
 
-                # 5. Auto-apply safe recommendations
-                if rec.auto_applicable and self._auto_apply_safe:
+                if rec.auto_applicable and self._auto_apply_safe and not rec.contested:
                     apply_result = await self._executor.apply_recommendation(rec)
                     if apply_result.get("status") == "applied":
                         rec.approval_status = ApprovalStatus.AUTO_APPLIED
@@ -184,10 +194,80 @@ class AICouncil:
 
         session.completed_at = datetime.utcnow().isoformat()
 
-        # 6. Publish events
+        # 7. Publish events
         await self._publish_session_events(session)
 
         return session
+
+    def _run_deliberation_round(self, session: CouncilSession) -> int:
+        """Deliberation round: identify and mark contested recommendations.
+
+        A recommendation is contested when 2+ council members evaluate the SAME
+        category with severities that differ by 2 or more levels:
+          LOW=0, MEDIUM=1, HIGH=2, CRITICAL=3
+
+        Example conflict: member A says RISK → CRITICAL, member B says RISK → LOW
+        (difference = 3 - 0 = 3 ≥ 2) → both are marked contested.
+
+        Contested recommendations are NOT auto-applied, regardless of auto_applicable flag.
+        They appear in get_pending_recommendations() for human review.
+
+        Returns number of recommendations marked as contested.
+        """
+        severity_rank = {
+            Severity.LOW: 0,
+            Severity.MEDIUM: 1,
+            Severity.HIGH: 2,
+            Severity.CRITICAL: 3,
+        }
+        rank_label = {v: k.value for k, v in severity_rank.items()}
+        _CONFLICT_THRESHOLD = 2  # Severity levels gap to trigger contest
+
+        # Group recommendations by category across all members
+        by_category: dict[str, list[Recommendation]] = defaultdict(list)
+        for review in session.reviews:
+            for rec in review.recommendations:
+                by_category[rec.category.value].append(rec)
+
+        contested_total = 0
+
+        for category, recs in by_category.items():
+            if len(recs) < 2:
+                continue  # Only one member reviewed this category — no conflict possible
+
+            # Check for severity divergence
+            ranks = [severity_rank[r.severity] for r in recs]
+            min_rank = min(ranks)
+            max_rank = max(ranks)
+
+            if max_rank - min_rank >= _CONFLICT_THRESHOLD:
+                # Identify which roles are on each end (for audit trail)
+                low_roles = [
+                    recs[i].member_role for i, r in enumerate(ranks) if r == min_rank
+                ]
+                high_roles = [
+                    recs[i].member_role for i, r in enumerate(ranks) if r == max_rank
+                ]
+                contested_roles = list(set(low_roles + high_roles))
+
+                for rec in recs:
+                    rec.contested = True
+                    # Record who disagrees (everyone except self)
+                    rec.contested_by = [r for r in contested_roles if r != rec.member_role]
+                    contested_total += 1
+
+                logger.warning(
+                    "[Council Deliberation] Category '%s' contested: "
+                    "severity %s vs %s (gap=%d). Low-severity: %s, High-severity: %s. "
+                    "%d recommendation(s) blocked from auto-apply.",
+                    category,
+                    rank_label[min_rank], rank_label[max_rank],
+                    max_rank - min_rank,
+                    low_roles, high_roles,
+                    len(recs),
+                )
+
+        return contested_total
 
     async def _get_member_review(
         self, member: CouncilMember, context: str
@@ -401,6 +481,9 @@ class AICouncil:
             1 for r in self._all_recommendations
             if r.approval_status == ApprovalStatus.PENDING
         )
+        contested = sum(
+            1 for r in self._all_recommendations if r.contested
+        )
         return {
             "enabled": self._running,
             "client_configured": self._client is not None,
@@ -409,6 +492,7 @@ class AICouncil:
             "total_sessions": len(self._sessions),
             "total_recommendations": len(self._all_recommendations),
             "pending_recommendations": pending,
+            "contested_recommendations": contested,
             "last_review_at": last_session.completed_at if last_session else None,
             "members": [
                 {"role": m.role, "model": m.model_id, "name": m.display_name}
@@ -426,6 +510,7 @@ class AICouncil:
                     "total_recommendations": session.total_recommendations,
                     "auto_applied": session.auto_applied_count,
                     "pending": session.pending_approval_count,
+                    "contested": session.contested_count,
                     "timestamp": session.completed_at,
                 },
             ))

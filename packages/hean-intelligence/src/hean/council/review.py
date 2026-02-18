@@ -53,6 +53,12 @@ class Recommendation(BaseModel):
     code_diff: str | None = None
     target_file: str | None = None
 
+    # Deliberation round: True если другой член совета кардинально не согласен
+    # (разница severity >= 2 уровня в той же категории). Contested рекомендации
+    # не применяются автоматически — требуют ручного рассмотрения.
+    contested: bool = False
+    contested_by: list[str] = Field(default_factory=list)  # Роли несогласных членов
+
 
 class CouncilReview(BaseModel):
     """Complete review from one council member."""
@@ -78,3 +84,4 @@ class CouncilSession(BaseModel):
     total_recommendations: int = 0
     auto_applied_count: int = 0
     pending_approval_count: int = 0
+    contested_count: int = 0  # Количество спорных рекомендаций (deliberation round)

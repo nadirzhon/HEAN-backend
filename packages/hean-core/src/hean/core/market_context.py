@@ -118,6 +118,11 @@ class UnifiedMarketContext:
     last_tick_at: datetime | None = None
     components_updated: dict[str, datetime] = field(default_factory=dict)
 
+    # Динамические веса от DynamicOracleWeightManager (обновляются при каждом PHYSICS_UPDATE)
+    # Ключи: "tcn", "finbert", "ollama", "brain" — суммируются в 1.0
+    # None = используются статические веса по умолчанию
+    oracle_weights: dict[str, float] | None = None
+
     # ─── Свойства для принятия решений ───────────────────────
 
     @property
@@ -133,20 +138,41 @@ class UnifiedMarketContext:
         Объединённая сила сигнала от всех компонентов.
         -1.0 = максимально bearish, +1.0 = максимально bullish, 0.0 = neutral.
 
-        Веса подобраны так:
+        Статические веса по умолчанию:
         - Order Flow (0.25) — самый быстрый и реактивный сигнал
         - TCN Prediction (0.25) — ML предсказание направления
         - Brain/Claude (0.20) — стратегический анализ
         - Physics (0.15) — фазовый анализ рынка
         - Causal (0.15) — pre-echo от lead symbols
+
+        При наличии oracle_weights (DynamicOracleWeightManager) TCN и Brain
+        перераспределяются пропорционально из общего бюджета 0.45 на основе
+        текущего рыночного режима. Physics, OFI, Causal остаются фиксированными.
         """
         signals: list[float] = []
-        weights: list[float] = []
+
+        # Базовые веса (статика)
+        w_physics = 0.15
+        w_tcn = 0.25
+        w_ofi = 0.25
+        w_brain = 0.20
+        w_causal = 0.15
+
+        # Динамические веса: перераспределяем TCN+Brain бюджет (0.45) на основе режима
+        if self.oracle_weights:
+            oracle_tcn = self.oracle_weights.get("tcn", 0.40)
+            oracle_brain = self.oracle_weights.get("brain", 0.20)
+            oracle_pair = oracle_tcn + oracle_brain
+            if oracle_pair > 0:
+                budget = w_tcn + w_brain  # = 0.45 всегда
+                w_tcn = budget * oracle_tcn / oracle_pair
+                w_brain = budget * oracle_brain / oracle_pair
 
         # Physics: phase direction
         phase_map = {
             "markup": +0.6, "accumulation": +0.3,
             "markdown": -0.6, "distribution": -0.3,
+            "water_bull": +0.2, "water_bear": -0.2,
         }
         physics_signal = phase_map.get(self.physics.phase, 0.0)
         if self.physics.phase_confidence > 0.5:
@@ -154,7 +180,6 @@ class UnifiedMarketContext:
         else:
             physics_signal *= 0.3  # Низкая уверенность — ослабляем
         signals.append(physics_signal)
-        weights.append(0.15)
 
         # TCN prediction
         if self.prediction.tcn_confidence > 0.5:
@@ -164,12 +189,10 @@ class UnifiedMarketContext:
             signals.append(direction * self.prediction.tcn_confidence)
         else:
             signals.append(0.0)
-        weights.append(0.25)
 
         # Order Flow — прямой сигнал
         net_aggression = self.order_flow.aggression_buy - self.order_flow.aggression_sell
         signals.append(max(-1.0, min(1.0, net_aggression)))
-        weights.append(0.25)
 
         # Brain analysis
         if self.brain.confidence > 0.4:
@@ -177,7 +200,6 @@ class UnifiedMarketContext:
             signals.append(brain_dir * self.brain.confidence)
         else:
             signals.append(0.0)
-        weights.append(0.20)
 
         # Causal pre-echo
         if self.causal.pre_echo_detected and self.causal.pre_echo_confidence > 0.6:
@@ -185,8 +207,8 @@ class UnifiedMarketContext:
             signals.append(causal_dir * self.causal.pre_echo_confidence)
         else:
             signals.append(0.0)
-        weights.append(0.15)
 
+        weights = [w_physics, w_tcn, w_ofi, w_brain, w_causal]
         total_weight = sum(weights)
         if total_weight == 0:
             return 0.0

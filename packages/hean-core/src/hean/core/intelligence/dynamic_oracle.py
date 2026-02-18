@@ -26,6 +26,18 @@ from hean.core.bus import EventBus
 from hean.core.types import Event, EventType
 from hean.logging import get_logger
 
+# Quorum thresholds by physics phase (Quorum Kill-Switch)
+_QUORUM_BY_PHASE: dict[str, int] = {
+    "ice": 1,     # Consolidation — even 1 fresh source is rare, allow it
+    "water": 2,   # Normal trend — require at least 2 agreeing sources
+    "vapor": 2,   # Chaos — require at least 2 (price action + 1 other)
+    "accumulation": 1,
+    "markup": 2,
+    "distribution": 2,
+    "markdown": 2,
+    "unknown": 2,
+}
+
 logger = get_logger(__name__)
 
 
@@ -67,6 +79,12 @@ class DynamicOracleWeighting:
             "brain": datetime.min,
         }
         self._signal_stale_threshold = timedelta(minutes=10)
+
+        # Quorum Kill-Switch: track last known direction per source
+        self._last_direction: dict[str, str] = {}
+
+        # No-trade counters for observability
+        self._no_trade_counts: dict[str, int] = {"oracle_quorum_fail": 0}
 
         # Performance tracking per source
         self._source_predictions: dict[str, deque] = {
@@ -133,21 +151,40 @@ class DynamicOracleWeighting:
             self._market_volatility[symbol] = data.get("volatility", 0.02)
 
     async def _handle_context_update(self, event: Event) -> None:
-        """Track signal freshness from context updates."""
+        """Track signal freshness and direction from context updates."""
         data = event.data
         ctx_type = data.get("type")
+        now = datetime.utcnow()
 
-        # Update signal timestamps
+        # Update signal timestamps and last known direction
         if ctx_type == "oracle_predictions":
-            self._last_signal_time["tcn"] = datetime.utcnow()
+            self._last_signal_time["tcn"] = now
+            # TCN direction: positive score = buy signal
+            score = data.get("signal_strength", data.get("score", 0.0))
+            if score != 0.0:
+                self._last_direction["tcn"] = "buy" if score > 0 else "sell"
         elif ctx_type == "finbert_sentiment":
-            self._last_signal_time["finbert"] = datetime.utcnow()
+            self._last_signal_time["finbert"] = now
+            score = data.get("score", 0.0)
+            if score != 0.0:
+                self._last_direction["finbert"] = "buy" if score > 0 else "sell"
         elif ctx_type == "ollama_sentiment":
-            self._last_signal_time["ollama"] = datetime.utcnow()
+            self._last_signal_time["ollama"] = now
+            score = data.get("score", 0.0)
+            if score != 0.0:
+                self._last_direction["ollama"] = "buy" if score > 0 else "sell"
 
     async def _handle_brain_analysis(self, event: Event) -> None:
-        """Track Brain signal freshness."""
+        """Track Brain signal freshness and direction."""
         self._last_signal_time["brain"] = datetime.utcnow()
+        # Extract direction from Brain signal if present
+        data = event.data
+        signal = data.get("signal", {})
+        action = signal.get("action", "").upper() if isinstance(signal, dict) else ""
+        if action in ("BUY",):
+            self._last_direction["brain"] = "buy"
+        elif action in ("SELL",):
+            self._last_direction["brain"] = "sell"
 
     async def _update_weights_loop(self) -> None:
         """Periodically update dynamic weights based on market conditions."""
@@ -244,6 +281,47 @@ class DynamicOracleWeighting:
         """Get current weights for ensemble."""
         return dict(self._current_weights)
 
+    def _count_fresh_agreeing_sources(
+        self,
+        signals: dict[str, float],
+        direction: str,
+        freshness_window_sec: int | None = None,
+    ) -> int:
+        """Count sources that are both fresh and directionally agreeing.
+
+        Implements the Quorum Kill-Switch: nuclear PAL-style authorization
+        requiring N independent fresh sources to agree before signal publication.
+
+        Args:
+            signals: Dict of {source: signal_value} for sources that provided a signal.
+            direction: Proposed trade direction ('buy' or 'sell').
+            freshness_window_sec: Max age in seconds to consider a source fresh.
+
+        Returns:
+            Number of fresh, agreeing sources.
+        """
+        window_sec = freshness_window_sec or settings.oracle_quorum_freshness_window_sec
+        freshness_cutoff = timedelta(seconds=window_sec)
+        now = datetime.utcnow()
+        count = 0
+
+        for source, signal_value in signals.items():
+            # Check freshness
+            last_time = self._last_signal_time.get(source, datetime.min)
+            if now - last_time > freshness_cutoff:
+                continue  # Stale — does not count toward quorum
+
+            # Check directional agreement
+            source_direction = "buy" if signal_value > 0 else "sell"
+            if source_direction == direction:
+                count += 1
+
+        return count
+
+    def get_no_trade_counts(self) -> dict[str, int]:
+        """Return no-trade counters for observability dashboards."""
+        return dict(self._no_trade_counts)
+
     def fuse_signals(
         self,
         tcn_signal: float | None = None,
@@ -309,6 +387,25 @@ class DynamicOracleWeighting:
 
         # Determine direction
         direction = "buy" if weighted_score > 0 else "sell"
+
+        # Quorum Kill-Switch: require minimum fresh agreeing sources (PAL-style authorization)
+        if settings.oracle_min_fresh_quorum > 1:
+            # Determine quorum threshold from current dominant physics phase
+            dominant_phase = (
+                max(set(self._market_phase.values()), key=list(self._market_phase.values()).count)
+                if self._market_phase
+                else "unknown"
+            )
+            required_quorum = _QUORUM_BY_PHASE.get(dominant_phase, settings.oracle_min_fresh_quorum)
+            fresh_agreeing = self._count_fresh_agreeing_sources(signals, direction)
+
+            if fresh_agreeing < required_quorum:
+                self._no_trade_counts["oracle_quorum_fail"] += 1
+                logger.debug(
+                    f"Oracle quorum not met: {fresh_agreeing}/{required_quorum} fresh agreeing sources "
+                    f"(phase={dominant_phase}, direction={direction}). Signal suppressed."
+                )
+                return None
 
         return {
             "direction": direction,

@@ -2,6 +2,7 @@
 
 Detects BTC -> ETH -> alts propagation patterns.
 Learns propagation delays in real-time.
+Computes real Pearson correlation (was hardcoded = 0.7).
 """
 
 import time
@@ -29,16 +30,21 @@ class PropagationStats:
     source: str
     target: str
     avg_delay_ms: float
-    correlation: float
+    correlation: float   # Real Pearson correlation [-1, 1]
     sample_count: int
 
 
 class CrossMarketImpulse:
-    """Detect and predict cross-market impulse propagation."""
+    """Detect and predict cross-market impulse propagation.
+
+    Computes real Pearson correlation between leader and follower returns
+    by aligning price histories to the nearest timestamp.
+    """
 
     SIGNIFICANT_MOVE_PCT = 0.003  # 0.3% = significant move
     MAX_PROPAGATION_DELAY_MS = 5000  # 5 seconds max
     MIN_SAMPLES = 10
+    CORRELATION_WINDOW = 200  # number of ticks for correlation calculation
 
     def __init__(
         self,
@@ -51,7 +57,7 @@ class CrossMarketImpulse:
         # Price history per symbol: (timestamp, price)
         self._prices: dict[str, deque] = {}
         for s in self.leaders + self.followers:
-            self._prices[s] = deque(maxlen=5000)
+            self._prices[s] = deque(maxlen=self.CORRELATION_WINDOW)
 
         # Propagation delay history: (source, target) -> delays in ms
         self._delays: dict[tuple[str, str], deque[float]] = {}
@@ -65,14 +71,30 @@ class CrossMarketImpulse:
         # Pending impulses waiting for propagation
         self._pending: list[ImpulseEvent] = []
 
+        # Cached correlations (recomputed every N new ticks)
+        self._correlation_cache: dict[tuple[str, str], float] = {}
+        self._ticks_since_corr_update: dict[tuple[str, str], int] = {}
+        self._corr_update_interval = 20  # recompute every 20 ticks
+
     def update(self, symbol: str, price: float) -> ImpulseEvent | None:
         """Update with new price data. Returns ImpulseEvent if significant move detected."""
         now = time.time()
 
         if symbol not in self._prices:
-            self._prices[symbol] = deque(maxlen=5000)
+            self._prices[symbol] = deque(maxlen=self.CORRELATION_WINDOW)
 
         self._prices[symbol].append((now, price))
+
+        # Invalidate correlation cache for pairs involving this symbol
+        for pair in list(self._correlation_cache.keys()):
+            if symbol in pair:
+                key = pair
+                self._ticks_since_corr_update[key] = (
+                    self._ticks_since_corr_update.get(key, 0) + 1
+                )
+                if self._ticks_since_corr_update[key] >= self._corr_update_interval:
+                    del self._correlation_cache[key]
+                    self._ticks_since_corr_update[key] = 0
 
         # Check for propagation of pending impulses
         self._check_propagations(symbol, price, now)
@@ -84,7 +106,7 @@ class CrossMarketImpulse:
                 self._pending.append(impulse)
                 self._impulses.append(impulse)
                 logger.info(
-                    f"[Impulse] {symbol} moved {impulse.source_price_change_pct*100:.2f}% "
+                    f"[Impulse] {symbol} moved {impulse.source_price_change_pct * 100:.2f}% "
                     f"- watching for propagation to {self.followers}"
                 )
                 return impulse
@@ -159,28 +181,95 @@ class CrossMarketImpulse:
 
                 logger.info(
                     f"[Impulse] Propagation: {impulse.source_symbol} -> {symbol} "
-                    f"in {delay_ms:.0f}ms (change={follower_change*100:.2f}%)"
+                    f"in {delay_ms:.0f}ms (change={follower_change * 100:.2f}%)"
                 )
 
         # Remove resolved
         for i in sorted(resolved, reverse=True):
             self._pending.pop(i)
 
+    # ── Real Pearson correlation ──────────────────────────────────────────────
+
+    def _calculate_correlation(self, source: str, target: str) -> float:
+        """Calculate real Pearson correlation between source and target returns.
+
+        Aligns histories by finding the nearest-timestamp price for each tick.
+        Falls back to 0.5 (neutral) if insufficient data.
+        """
+        src_hist = list(self._prices.get(source, []))
+        tgt_hist = list(self._prices.get(target, []))
+
+        if len(src_hist) < self.MIN_SAMPLES or len(tgt_hist) < self.MIN_SAMPLES:
+            return 0.5  # neutral fallback
+
+        # Align: for each source tick, find nearest target price
+        src_times = np.array([t for t, _ in src_hist])
+        src_prices = np.array([p for _, p in src_hist])
+        tgt_times = np.array([t for t, _ in tgt_hist])
+        tgt_prices = np.array([p for _, p in tgt_hist])
+
+        aligned_tgt: list[float] = []
+        aligned_src: list[float] = []
+
+        for i, st in enumerate(src_times):
+            # Find closest target timestamp
+            idx = int(np.argmin(np.abs(tgt_times - st)))
+            time_diff = abs(tgt_times[idx] - st)
+            # Only use if target is within 2 seconds of source tick
+            if time_diff < 2.0:
+                aligned_src.append(src_prices[i])
+                aligned_tgt.append(tgt_prices[idx])
+
+        if len(aligned_src) < self.MIN_SAMPLES:
+            return 0.5
+
+        # Compute returns
+        src_arr = np.array(aligned_src)
+        tgt_arr = np.array(aligned_tgt)
+
+        src_ret = np.diff(src_arr) / (src_arr[:-1] + 1e-12)
+        tgt_ret = np.diff(tgt_arr) / (tgt_arr[:-1] + 1e-12)
+
+        if len(src_ret) < 3 or len(tgt_ret) < 3:
+            return 0.5
+
+        # Pearson correlation
+        corr = float(np.corrcoef(src_ret, tgt_ret)[0, 1])
+        if np.isnan(corr):
+            return 0.5
+
+        return float(np.clip(corr, -1.0, 1.0))
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
     def get_propagation_stats(self) -> list[PropagationStats]:
-        """Get propagation statistics for all leader->follower pairs."""
+        """Get propagation statistics with real Pearson correlation."""
         stats = []
         for (source, target), delays in self._delays.items():
             delay_list = list(delays)
             if len(delay_list) < self.MIN_SAMPLES:
                 continue
+
+            # Use cached correlation or recompute
+            cache_key = (source, target)
+            if cache_key not in self._correlation_cache:
+                self._correlation_cache[cache_key] = self._calculate_correlation(source, target)
+
             stats.append(PropagationStats(
                 source=source,
                 target=target,
                 avg_delay_ms=float(np.mean(delay_list)),
-                correlation=0.7,  # Simplified
+                correlation=self._correlation_cache[cache_key],
                 sample_count=len(delay_list),
             ))
         return stats
+
+    def get_correlation(self, source: str, target: str) -> float:
+        """Get current Pearson correlation between two symbols."""
+        key = (source, target)
+        if key not in self._correlation_cache:
+            self._correlation_cache[key] = self._calculate_correlation(source, target)
+        return self._correlation_cache[key]
 
     def get_recent_impulses(self, limit: int = 20) -> list[ImpulseEvent]:
         return list(self._impulses)[-limit:]

@@ -81,10 +81,10 @@ class IntelligenceGate:
             await self._publish_enriched(signal)
             return
 
-        # Enrich signal metadata with intelligence data
+        # Enrich signal metadata with intelligence data (includes graduated boost)
         self._enrich_metadata(signal, context)
 
-        # Optional rejection check
+        # Optional rejection check — uses graduated boost tier internally
         if settings.intelligence_gate_reject_on_contradiction:
             should_reject, reason = self._check_contradiction(signal, context)
             if should_reject:
@@ -114,7 +114,15 @@ class IntelligenceGate:
         return self._context_aggregator.get_context(symbol)
 
     def _enrich_metadata(self, signal: Signal, context: UnifiedMarketContext) -> None:
-        """Add intelligence data to signal metadata."""
+        """Add intelligence data to signal metadata with graduated boost.
+
+        Graduated scale (5 tiers based on alignment score):
+          score < -0.7  → STRONG CONTRADICTION  → boost = 0.0 (signals rejection)
+          -0.7 to -0.4  → MODERATE OPPOSITION   → boost = 0.5 (heavy reduction)
+          -0.4 to  0.0  → WEAK OPPOSITION        → boost = 0.8 (slight reduction)
+           0.0 to  0.5  → AGREEMENT              → boost = 1.0 (neutral)
+          >  0.5        → STRONG AGREEMENT       → boost = 1.3 (enhancement)
+        """
         if signal.metadata is None:
             signal.metadata = {}
 
@@ -137,44 +145,60 @@ class IntelligenceGate:
         overall = context.overall_signal_strength
         signal.metadata["intelligence_strength"] = overall
 
-        # Compute intelligence boost for sizing (0.7 to 1.3)
-        # Aligns signal direction with intelligence consensus
+        # Alignment: positive = intelligence agrees with signal direction
         is_buy = signal.side.lower() == "buy"
         alignment = overall if is_buy else -overall
-        # alignment > 0 means intelligence agrees with signal direction
-        # alignment < 0 means intelligence disagrees
-        boost = 1.0 + (alignment * 0.3)  # Range: 0.7 to 1.3
-        boost = max(0.7, min(1.3, boost))
+
+        # Graduated boost (5 tiers)
+        boost, tier = self._graduated_boost(alignment)
         signal.metadata["intelligence_boost"] = boost
+        signal.metadata["intelligence_tier"] = tier
+
+    @staticmethod
+    def _graduated_boost(alignment: float) -> tuple[float, str]:
+        """Compute graduated size boost from alignment score.
+
+        Returns (boost_multiplier, tier_label).
+        """
+        if alignment < -0.7:
+            return 0.0, "strong_contradiction"   # Signals rejection
+        elif alignment < -0.4:
+            return 0.5, "moderate_opposition"    # Heavy size reduction
+        elif alignment < 0.0:
+            return 0.8, "weak_opposition"        # Slight reduction
+        elif alignment < 0.5:
+            return 1.0, "agreement"              # Neutral
+        else:
+            return 1.3, "strong_agreement"       # Size enhancement
 
     def _check_contradiction(
         self, signal: Signal, context: UnifiedMarketContext
     ) -> tuple[bool, str]:
         """Check if intelligence strongly contradicts signal direction.
 
-        Only rejects when:
-        1. Intelligence has strong confidence (overall_signal_strength > 0.5)
-        2. Direction is opposite to signal
-        3. Oracle confidence exceeds threshold
+        Uses the graduated scale — rejects when:
+        1. Alignment score ≤ -0.7 (strong_contradiction tier), OR
+        2. Oracle has high confidence AND predicts opposite direction
 
         Returns (should_reject, reason).
         """
         overall = context.overall_signal_strength
         is_buy = signal.side.lower() == "buy"
+        alignment = overall if is_buy else -overall
 
-        # Check directional conflict
-        if is_buy and overall < -0.5:
-            return True, f"buy signal contradicts bearish consensus ({overall:.2f})"
-        if not is_buy and overall > 0.5:
-            return True, f"sell signal contradicts bullish consensus ({overall:.2f})"
+        # Graduated rejection: only at strong_contradiction tier
+        if alignment < -0.7:
+            return True, (
+                f"{'buy' if is_buy else 'sell'} signal vs "
+                f"{'bearish' if is_buy else 'bullish'} consensus "
+                f"(alignment={alignment:.2f}, tier=strong_contradiction)"
+            )
 
-        # Check oracle reversal probability
+        # Oracle high-confidence override (second rejection path)
         if context.prediction and context.prediction.confidence > 0:
             oracle_conf = context.prediction.confidence
             oracle_dir = context.prediction.direction
-            min_conf = settings.intelligence_gate_min_oracle_confidence_for_reject if hasattr(
-                settings, "intelligence_gate_min_oracle_confidence_for_reject"
-            ) else 0.7
+            min_conf = getattr(settings, "intelligence_gate_min_oracle_confidence_for_reject", 0.7)
 
             if oracle_conf >= min_conf:
                 if is_buy and oracle_dir == "sell":

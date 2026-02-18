@@ -92,18 +92,29 @@ class TCPriceReversalPredictor:
     """
     Lightweight TCN-based predictor for immediate price reversal.
     Processes last 10,000 micro-ticks to predict reversal probability.
+
+    Implements actuarial credibility weighting (Bühlmann credibility theory):
+    effective_confidence = Z * tcn_output + (1 - Z) * 0.5
+    where Z = n / (n + K), n = training updates, K = credibility constant.
+    This prevents an untrained model from producing high-confidence signals.
     """
 
-    def __init__(self, sequence_length: int = 10000, device: str = "cpu"):
+    def __init__(self, sequence_length: int = 10000, device: str = "cpu", credibility_constant: float | None = None):
         """
         Initialize TCN predictor.
 
         Args:
             sequence_length: Number of micro-ticks to process (default: 10,000)
             device: Device to run model on ("cpu" or "cuda")
+            credibility_constant: K in Z=n/(n+K). Defaults to settings value (30.0).
+                Lower K = faster credibility gain. Set to 0 to disable credibility weighting.
         """
         self.sequence_length = sequence_length
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+        # Credibility constant K (actuarial Bühlmann credibility theory)
+        # Loaded from settings lazily to avoid import-time issues in tests
+        self._credibility_constant: float = credibility_constant if credibility_constant is not None else 30.0
 
         # Input features: [price_change, volume, bid_ask_spread, time_delta]
         input_size = 4
@@ -213,27 +224,58 @@ class TCPriceReversalPredictor:
 
         return probability, should_trigger
 
-    def get_prediction_with_confidence(self) -> dict:
+    def get_credibility_factor(self) -> float:
+        """Compute Bühlmann credibility factor Z = n / (n + K).
+
+        Returns:
+            Z in [0, 1]: 0 = no credibility (untrained), 1 = full credibility.
         """
-        Get reversal prediction with confidence intervals.
+        K = self._credibility_constant
+        if K <= 0:
+            return 1.0  # Credibility weighting disabled
+        n = float(self._training_metrics["total_updates"])
+        return n / (n + K)
+
+    def get_prediction_with_confidence(self) -> dict:
+        """Get reversal prediction with actuarial credibility weighting.
+
+        Applies Bühlmann credibility theory: effective probability is pulled
+        toward the prior (0.5) proportional to how little the model has been
+        trained. An untrained TCN (n=0) always returns 0.5 regardless of its
+        random weights output.
 
         Returns:
             Dictionary with:
-            - probability: Reversal probability (0.0 to 1.0)
-            - should_trigger: True if > 85%
-            - confidence_high: Upper confidence bound
-            - confidence_low: Lower confidence bound
+            - probability: Raw TCN output (0.0 to 1.0)
+            - credibility_weighted_probability: Credibility-adjusted probability
+            - credibility_factor: Z = n/(n+K), 0=untrained, 1=fully trained
+            - should_trigger: True if credibility_weighted_probability > threshold AND Z > 0.3
+            - confidence_high / confidence_low: Uncertainty bounds scaled by Z
             - ticks_processed: Number of ticks in buffer
         """
-        probability, should_trigger = self.predict_reversal_probability()
+        probability, _ = self.predict_reversal_probability()
 
-        # Simple confidence intervals (in production, use ensemble or dropout uncertainty)
-        confidence_std = 0.05  # 5% uncertainty estimate
-        confidence_high = min(1.0, probability + confidence_std)
-        confidence_low = max(0.0, probability - confidence_std)
+        # Actuarial credibility weighting
+        Z = self.get_credibility_factor()
+        prior = 0.5  # Random baseline — no directional edge
+        credibility_weighted_prob = Z * probability + (1 - Z) * prior
+
+        # Only trigger if BOTH credibility-adjusted prob exceeds threshold AND model
+        # has sufficient training history (Z > 0.3 means n >= 0.3K updates)
+        should_trigger = (
+            credibility_weighted_prob > self.reversal_threshold
+            and Z > 0.3
+        )
+
+        # Confidence intervals: uncertainty shrinks as credibility grows
+        confidence_std = 0.05 * (1.0 - Z * 0.5)  # ±5% untrained, ±2.5% fully trained
+        confidence_high = min(1.0, credibility_weighted_prob + confidence_std)
+        confidence_low = max(0.0, credibility_weighted_prob - confidence_std)
 
         return {
             "probability": probability,
+            "credibility_weighted_probability": credibility_weighted_prob,
+            "credibility_factor": Z,
             "should_trigger": should_trigger,
             "confidence_high": confidence_high,
             "confidence_low": confidence_low,

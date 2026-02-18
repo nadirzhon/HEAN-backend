@@ -34,7 +34,7 @@ DEFAULT_MEMBERS: list[CouncilMember] = [
     CouncilMember(
         role="reviewer",
         display_name="Code Reviewer (Claude)",
-        model_id="anthropic/claude-sonnet-4-5-20250929",
+        model_id="anthropic/claude-sonnet-4-6",
         system_prompt=REVIEWER_PROMPT,
         max_tokens=2000,
         temperature=0.2,

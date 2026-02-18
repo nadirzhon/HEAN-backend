@@ -57,7 +57,7 @@ class ClaudeBrainClient:
             try:
                 import anthropic
                 self._anthropic_client = anthropic.AsyncAnthropic(api_key=self._api_key)
-                logger.info("Brain: Anthropic client initialized (fallback)")
+                logger.info("Brain: Anthropic client initialized (claude-sonnet-4-6)")
             except ImportError:
                 logger.warning("Brain: anthropic package not installed, using rule-based fallback")
 
@@ -66,6 +66,14 @@ class ClaudeBrainClient:
         self._latest_participants: dict[str, dict[str, Any]] = {}
         self._latest_anomalies: list[dict[str, Any]] = []
         self._latest_temporal: dict[str, Any] = {}
+
+        # Price tracking (updated from PHYSICS_UPDATE events)
+        self._current_prices: dict[str, float] = {}       # symbol → latest price
+        self._prev_prices: dict[str, float] = {}          # symbol → price from prev analysis cycle
+        self._rolling_pnl: float | None = None            # injected by accounting if available
+
+        # Rolling memory: last N analysis summaries for context continuity
+        self._rolling_memory: deque[str] = deque(maxlen=5)
 
         # History
         self._thoughts: deque[BrainThought] = deque(maxlen=200)
@@ -80,6 +88,7 @@ class ClaudeBrainClient:
         self._running = True
         self._bus.subscribe(EventType.CONTEXT_UPDATE, self._handle_context_update)
         self._bus.subscribe(EventType.SELF_ANALYTICS, self._handle_self_insight)
+        self._bus.subscribe(EventType.PHYSICS_UPDATE, self._handle_physics_update)
         self._analysis_task = asyncio.create_task(self._analysis_loop())
         provider = "openrouter/qwen3" if self._openrouter_client else (
             "anthropic/claude" if self._anthropic_client else "rule-based"
@@ -93,6 +102,7 @@ class ClaudeBrainClient:
         self._running = False
         self._bus.unsubscribe(EventType.CONTEXT_UPDATE, self._handle_context_update)
         self._bus.unsubscribe(EventType.SELF_ANALYTICS, self._handle_self_insight)
+        self._bus.unsubscribe(EventType.PHYSICS_UPDATE, self._handle_physics_update)
         if self._analysis_task:
             self._analysis_task.cancel()
             try:
@@ -114,6 +124,17 @@ class ClaudeBrainClient:
             symbol = data.get("symbol", "BTCUSDT")
             self._latest_participants[symbol] = data.get("breakdown", {})
 
+    async def _handle_physics_update(self, event: Event) -> None:
+        """Track current price from PHYSICS_UPDATE for prompt enrichment."""
+        data = event.data
+        symbol = data.get("symbol")
+        physics = data.get("physics", {})
+        if symbol and physics:
+            # PhysicsUpdate doesn't carry price directly — use temperature trend as proxy
+            # Price is tracked separately via the tick→physics→symbol mapping
+            # Store physics data keyed by symbol for snapshot formatter
+            self._latest_physics[symbol] = physics
+
     async def _handle_self_insight(self, event: Event) -> None:
         """Handle SELF_ANALYTICS events."""
         self._self_insight = event.data
@@ -134,10 +155,35 @@ class ClaudeBrainClient:
                 if not physics:
                     continue
 
+                # Compute price change % from previous cycle
+                price = self._current_prices.get(symbol)
+                prev_price = self._prev_prices.get(symbol)
+                price_change_pct: float | None = None
+                if price and prev_price and prev_price > 0:
+                    price_change_pct = (price - prev_price) / prev_price * 100
+                self._prev_prices[symbol] = price or prev_price or 0.0
+
+                # Snapshot current prices for next cycle comparison
+                if physics:
+                    # Attempt to extract price from physics state (injected by engine if available)
+                    p = physics.get("price") or physics.get("last_price")
+                    if p:
+                        self._current_prices[symbol] = float(p)
+
+                memory = list(self._rolling_memory)  # Last N summaries
+
                 if self._openrouter_client:
-                    analysis = await self._openrouter_analysis(physics, participants)
+                    analysis = await self._openrouter_analysis(
+                        physics, participants,
+                        price=price, price_change_pct=price_change_pct,
+                        recent_memory=memory,
+                    )
                 elif self._anthropic_client:
-                    analysis = await self._claude_analysis(physics, participants)
+                    analysis = await self._claude_analysis(
+                        physics, participants,
+                        price=price, price_change_pct=price_change_pct,
+                        recent_memory=memory,
+                    )
                 else:
                     analysis = self._rule_based_analysis(physics, participants)
 
@@ -145,6 +191,10 @@ class ClaudeBrainClient:
                     self._analyses.append(analysis)
                     for thought in analysis.thoughts:
                         self._thoughts.append(thought)
+
+                    # Store summary in rolling memory for context continuity
+                    if analysis.summary:
+                        self._rolling_memory.append(analysis.summary[:150])
 
                     # Publish BRAIN_ANALYSIS event for strategies to consume
                     await self._publish_brain_analysis(symbol, analysis)
@@ -192,6 +242,9 @@ class ClaudeBrainClient:
         self,
         physics: dict[str, Any],
         participants: dict[str, Any] | None,
+        price: float | None = None,
+        price_change_pct: float | None = None,
+        recent_memory: list[str] | None = None,
     ) -> BrainAnalysis | None:
         """Run OpenRouter/Qwen3-Max-Thinking analysis (cheapest provider)."""
         prompt = MarketSnapshotFormatter.format(
@@ -199,6 +252,10 @@ class ClaudeBrainClient:
             participants=participants,
             anomalies=self._latest_anomalies[:5] if self._latest_anomalies else None,
             temporal=self._latest_temporal or None,
+            price=price,
+            price_change_pct=price_change_pct,
+            rolling_pnl=self._rolling_pnl,
+            recent_memory=recent_memory,
         )
         prompt = self._append_self_insight(prompt)
 
@@ -248,13 +305,20 @@ class ClaudeBrainClient:
         except Exception as e:
             logger.warning(f"OpenRouter API error: {e}, falling back to Anthropic")
             if self._anthropic_client:
-                return await self._claude_analysis(physics, participants)
+                return await self._claude_analysis(
+                    physics, participants,
+                    price=price, price_change_pct=price_change_pct,
+                    recent_memory=recent_memory,
+                )
             return self._rule_based_analysis(physics, participants)
 
     async def _claude_analysis(
         self,
         physics: dict[str, Any],
         participants: dict[str, Any] | None,
+        price: float | None = None,
+        price_change_pct: float | None = None,
+        recent_memory: list[str] | None = None,
     ) -> BrainAnalysis | None:
         """Run Claude API analysis (fallback, more expensive)."""
         prompt = MarketSnapshotFormatter.format(
@@ -262,12 +326,16 @@ class ClaudeBrainClient:
             participants=participants,
             anomalies=self._latest_anomalies[:5] if self._latest_anomalies else None,
             temporal=self._latest_temporal or None,
+            price=price,
+            price_change_pct=price_change_pct,
+            rolling_pnl=self._rolling_pnl,
+            recent_memory=recent_memory,
         )
         prompt = self._append_self_insight(prompt)
 
         try:
             message = await self._anthropic_client.messages.create(
-                model="claude-sonnet-4-5-20250929",
+                model="claude-sonnet-4-6",
                 max_tokens=500,
                 messages=[{"role": "user", "content": prompt}],
             )

@@ -11,11 +11,15 @@ Production-grade with full observability and audit trail.
 import time
 from dataclasses import dataclass
 
+from hean.config import settings
 from hean.core.bus import EventBus
 from hean.core.types import Event, EventType
 from hean.logging import get_logger
 
 logger = get_logger(__name__)
+
+# How long (seconds) a source may be silenced before we log a warning
+_SILENCE_WARNING_THRESHOLD_SEC = 7200  # 2 hours
 
 
 @dataclass
@@ -55,20 +59,25 @@ class DynamicOracleWeightManager:
     }
 
     # Regime-specific weight adjustments
+    # Regime Silencing (Idea 1.2): irrelevant sources get 0% in specific regimes.
+    # ICE (consolidation): TCN silenced — no price reversals to predict in sideways markets.
+    #   News/sentiment is the catalyst for breakout; concentrate weight there.
+    # VAPOR (chaos): Brain silenced — 60s analysis cadence is too slow for cascading moves.
+    #   Price action (TCN) dominates; trust raw tick data over periodic LLM analysis.
     REGIME_WEIGHTS = {
-        "vapor": {  # High volatility, chaos
-            "tcn": 0.60,
+        "vapor": {  # High volatility, chaos — price action dominates
+            "tcn": 0.75,    # Dominant: pure price action in chaos
             "finbert": 0.15,
-            "ollama": 0.15,
-            "brain": 0.10,
+            "ollama": 0.10,
+            "brain": 0.00,  # SILENCED: 60s cadence useless in VAPOR
         },
-        "ice": {  # Low volatility, sideways
-            "tcn": 0.30,
-            "finbert": 0.25,
-            "ollama": 0.25,
-            "brain": 0.20,
+        "ice": {  # Low volatility, consolidation — wait for sentiment catalyst
+            "tcn": 0.00,    # SILENCED: no reversals to predict in sideways market
+            "finbert": 0.40,  # News sentiment = breakout catalyst
+            "ollama": 0.35,
+            "brain": 0.25,
         },
-        "water": {  # Normal trending
+        "water": {  # Normal trending — balanced
             "tcn": 0.40,
             "finbert": 0.20,
             "ollama": 0.20,
@@ -135,6 +144,9 @@ class DynamicOracleWeightManager:
         self._physics_states: dict[str, dict] = {}  # symbol -> physics state
         self._last_update: dict[str, float] = {}
 
+        # Silencing monitor: track when each source first became 0% per symbol
+        self._silence_start: dict[str, dict[str, float]] = {}  # symbol -> {source -> start_time}
+
     async def start(self) -> None:
         """Start dynamic weight manager."""
         self._bus.subscribe(EventType.PHYSICS_UPDATE, self._handle_physics_update)
@@ -146,7 +158,7 @@ class DynamicOracleWeightManager:
         logger.info("DynamicOracleWeightManager stopped")
 
     async def _handle_physics_update(self, event: Event) -> None:
-        """Handle physics state updates."""
+        """Handle physics state updates — recalculate weights and publish to context."""
         data = event.data
         symbol = data.get("symbol")
         if not symbol:
@@ -173,6 +185,22 @@ class DynamicOracleWeightManager:
                     f"(regime: {new_weights.regime})"
                 )
 
+            # Publish weights to ContextAggregator so market_context.overall_signal_strength
+            # uses dynamic weighting based on current market regime
+            await self._bus.publish(Event(
+                event_type=EventType.CONTEXT_UPDATE,
+                data={
+                    "context_type": "oracle_weights",
+                    "symbol": symbol,
+                    "weights": {
+                        "tcn": new_weights.tcn_weight,
+                        "finbert": new_weights.finbert_weight,
+                        "ollama": new_weights.ollama_weight,
+                        "brain": new_weights.brain_weight,
+                    },
+                },
+            ))
+
     def _calculate_weights(self, symbol: str, physics: dict) -> WeightConfig | None:
         """Calculate Oracle weights based on physics state.
 
@@ -190,7 +218,18 @@ class DynamicOracleWeightManager:
             return None
 
         # Get base weights for current regime
-        regime_weights = self.REGIME_WEIGHTS.get(phase, self.BASE_WEIGHTS)
+        # Regime Silencing: when oracle_regime_silencing_enabled, use the full REGIME_WEIGHTS
+        # (which already has TCN=0 for ICE and Brain=0 for VAPOR).
+        # If disabled, fall back to BASE_WEIGHTS for backward compatibility.
+        if settings.oracle_regime_silencing_enabled:
+            regime_weights = self.REGIME_WEIGHTS.get(phase, self.BASE_WEIGHTS)
+        else:
+            # Silencing disabled — use legacy weights (TCN always active)
+            legacy_weights = {
+                "vapor": {"tcn": 0.60, "finbert": 0.15, "ollama": 0.15, "brain": 0.10},
+                "ice":   {"tcn": 0.30, "finbert": 0.25, "ollama": 0.25, "brain": 0.20},
+            }
+            regime_weights = legacy_weights.get(phase, self.REGIME_WEIGHTS.get(phase, self.BASE_WEIGHTS))
 
         # Get SSD adjustments
         ssd_adjustments = self.SSD_ADJUSTMENTS.get(ssd_mode, self.SSD_ADJUSTMENTS["normal"])
@@ -224,6 +263,21 @@ class DynamicOracleWeightManager:
         finbert /= total
         ollama /= total
         brain /= total
+
+        # Silencing monitor: warn if a source has been at 0% for > 2 hours
+        now = time.time()
+        silence_map = self._silence_start.setdefault(symbol, {})
+        computed = {"tcn": tcn, "finbert": finbert, "ollama": ollama, "brain": brain}
+        for src, w in computed.items():
+            if w == 0.0:
+                start = silence_map.setdefault(src, now)
+                if now - start > _SILENCE_WARNING_THRESHOLD_SEC:
+                    logger.warning(
+                        f"Source '{src}' has been silenced for {(now - start) / 3600:.1f}h "
+                        f"on {symbol} (phase={phase}). Check regime detection."
+                    )
+            else:
+                silence_map.pop(src, None)  # Source is active — reset timer
 
         return WeightConfig(
             tcn_weight=tcn,

@@ -507,6 +507,26 @@ class HEANSettings(BaseSettings):
         default=True,
         description="Enable dynamic AI/ML model weighting based on market conditions",
     )
+    oracle_min_fresh_quorum: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="Minimum fresh+agreeing sources required to publish oracle signal (Quorum Kill-Switch)",
+    )
+    oracle_quorum_freshness_window_sec: int = Field(
+        default=300,
+        gt=0,
+        description="Max age in seconds for a source to be considered fresh for quorum check",
+    )
+    oracle_regime_silencing_enabled: bool = Field(
+        default=True,
+        description="Silence irrelevant sources by regime: TCN=0 in ICE phase, Brain=0 in VAPOR phase",
+    )
+    tcn_credibility_constant: float = Field(
+        default=30.0,
+        gt=0,
+        description="Credibility constant K in Z=n/(n+K). Lower K = faster credibility gain (actuarial)",
+    )
 
     # Physics-Aware Position Sizing
     physics_aware_sizing: bool = Field(

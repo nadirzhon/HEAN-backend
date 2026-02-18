@@ -87,11 +87,18 @@ class OracleEngine:
                 logger.debug(f"Fingerprinting error for {tick.symbol}: {e}")
 
         # Combine predictions
+        # Use credibility_weighted_probability if available (Credibility Deflation feature).
+        # This prevents an untrained TCN (Z≈0) from producing high-confidence signals.
+        # Falls back to raw 'probability' for backward compatibility.
+        tcn_prob = tcn_result.get('credibility_weighted_probability', tcn_result['probability'])
+
         prediction = {
             'symbol': tick.symbol,
             'timestamp': tick.timestamp,
             'current_price': tick.price,
-            'tcn_reversal_prob': tcn_result['probability'],
+            'tcn_reversal_prob': tcn_prob,
+            'tcn_reversal_prob_raw': tcn_result['probability'],  # Raw for observability
+            'tcn_credibility_factor': tcn_result.get('credibility_factor', 1.0),
             'tcn_should_trigger': tcn_result['should_trigger'],
             'tcn_confidence_high': tcn_result['confidence_high'],
             'tcn_confidence_low': tcn_result['confidence_low'],
