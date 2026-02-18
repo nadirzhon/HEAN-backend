@@ -4,7 +4,7 @@ import json
 import os
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -562,6 +562,31 @@ class HEANSettings(BaseSettings):
         description="Redis stream consumer group prefix for MicroservicesBridge.",
     )
 
+    # EventBus configuration
+    bus_circuit_open_threshold: float = Field(
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+        description="Queue utilization fraction at which EventBus circuit breaker opens (default 0.95 = 95%)",
+    )
+    bus_circuit_close_threshold: float = Field(
+        default=0.70,
+        ge=0.0,
+        le=1.0,
+        description="Queue utilization fraction at which EventBus circuit breaker closes (default 0.70 = 70%)",
+    )
+    bus_degraded_threshold: float = Field(
+        default=0.80,
+        ge=0.0,
+        le=1.0,
+        description="Queue utilization fraction at which EventBus enters degraded state (default 0.80 = 80%)",
+    )
+    bus_max_queue_size: int = Field(
+        default=50000,
+        gt=0,
+        description="Maximum EventBus queue size across all priority levels (anti-memory-leak guard)",
+    )
+
     # AI Factory (Shadow → Canary → Production pipeline)
     ai_factory_enabled: bool = Field(
         default=True,
@@ -587,6 +612,24 @@ class HEANSettings(BaseSettings):
     council_auto_apply_safe: bool = Field(
         default=True,
         description="Auto-apply safe parameter/strategy recommendations",
+    )
+
+    # Trade Council 2.0 (real-time adversarial signal evaluation)
+    trade_council_enabled: bool = Field(
+        default=True,
+        description="Enable adversarial Trade Council for real-time signal evaluation",
+    )
+    trade_council_entry_threshold: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Minimum weighted confidence to approve a trade (0-1)",
+    )
+    trade_council_exit_threshold: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Below this confidence, consider early exit (0-1)",
     )
 
     self_insight_enabled: bool = Field(
@@ -627,6 +670,14 @@ class HEANSettings(BaseSettings):
 
     # Observability
     log_level: str = Field(default="INFO", description="Logging level")
+    log_format: str = Field(
+        default="text",
+        description=(
+            "Log output format: 'json' for structured JSON (Loki/Datadog/CloudWatch) "
+            "or 'text' for human-readable console output (local development). "
+            "Defaults to 'text'; set LOG_FORMAT=json in Docker/production environments."
+        ),
+    )
     health_check_port: int = Field(default=8080, gt=0, le=65535, description="Health check port")
     debug_mode: bool = Field(
         default=False,
@@ -983,6 +1034,27 @@ class HEANSettings(BaseSettings):
         description="If True, blocks counter-phase signals; if False, only penalizes",
     )
 
+    # Physics engine publish throttling and normalisation
+    physics_publish_min_interval_ms: int = Field(
+        default=100,
+        ge=0,
+        description=(
+            "Minimum milliseconds between PHYSICS_UPDATE publishes per symbol. "
+            "Publish always occurs on phase change regardless of this setting. "
+            "Set to 0 to disable throttling (publish every tick)."
+        ),
+    )
+    physics_temperature_normalize_window: int = Field(
+        default=1000,
+        ge=10,
+        description="Rolling window size (in ticks) for per-symbol temperature z-score normalisation.",
+    )
+    physics_entropy_normalize_window: int = Field(
+        default=1000,
+        ge=10,
+        description="Rolling window size (in ticks) for per-symbol entropy z-score normalisation.",
+    )
+
     # Digital Organism: MarketGenomeDetector (Stage 1)
     market_genome_enabled: bool = Field(
         default=True,
@@ -1136,6 +1208,33 @@ class HEANSettings(BaseSettings):
 
         # Paper trade assist is deprecated - no validation needed
         # System always uses Bybit testnet for safety
+
+    @model_validator(mode='after')
+    def validate_risk_limits(self) -> 'HEANSettings':
+        """Validate cross-field constraints to catch dangerous configuration combinations."""
+        # max_trade_risk_pct * max_open_positions should not exceed 100%
+        # (both stored as percent, e.g. 1.0 = 1%)
+        combined_risk = (self.max_trade_risk_pct / 100.0) * self.max_open_positions
+        if combined_risk > 1.0:
+            import warnings
+            warnings.warn(
+                f"max_trade_risk_pct ({self.max_trade_risk_pct:.1f}%) * "
+                f"max_open_positions ({self.max_open_positions}) = "
+                f"{combined_risk:.1%} > 100%. This allows theoretically >100% capital at risk.",
+                stacklevel=2,
+            )
+
+        # bus thresholds must be ordered correctly
+        if self.bus_circuit_close_threshold >= self.bus_circuit_open_threshold:
+            import warnings
+            warnings.warn(
+                f"bus_circuit_close_threshold ({self.bus_circuit_close_threshold}) must be "
+                f"less than bus_circuit_open_threshold ({self.bus_circuit_open_threshold}). "
+                "Circuit breaker may oscillate.",
+                stacklevel=2,
+            )
+
+        return self
 
     @property
     def is_live(self) -> bool:

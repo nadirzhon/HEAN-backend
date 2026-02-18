@@ -21,6 +21,14 @@ def _get_council():
     return None
 
 
+def _get_trade_council():
+    """Get trade council from facade."""
+    facade = get_facade()
+    if facade and hasattr(facade, "_trade_council"):
+        return facade._trade_council
+    return None
+
+
 @router.get("/status")
 async def get_council_status():
     """Get council health and last review times."""
@@ -94,3 +102,24 @@ async def trigger_review():
     session = await council._run_review_session()
     council._sessions.append(session)
     return session.model_dump()
+
+
+# ── Trade Council 2.0 endpoints ──────────────────────────────────────────
+
+
+@router.get("/trade/status")
+async def get_trade_council_status():
+    """Get Trade Council status: agents, reputation scores, approval rate."""
+    tc = _get_trade_council()
+    if tc:
+        return tc.get_status()
+    return {"enabled": False, "message": "Trade Council not active"}
+
+
+@router.get("/trade/verdicts")
+async def get_trade_verdicts(limit: int = Query(default=20, le=100)):
+    """Get recent trade verdicts with vote details."""
+    tc = _get_trade_council()
+    if tc:
+        return tc.get_recent_verdicts(limit)
+    return []

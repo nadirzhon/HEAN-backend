@@ -156,6 +156,8 @@ class TradingSystem:
 
         # AI Council (multi-model periodic system review)
         self._council = None
+        # Trade Council 2.0 (real-time adversarial signal evaluation)
+        self._trade_council = None
 
         # ARCHON — Brain-Orchestrator
         self._archon: Any = None  # TYPE_CHECKING import to avoid circular dependency
@@ -1162,6 +1164,22 @@ class TradingSystem:
             except Exception as e:
                 logger.warning(f"Could not start AI Council: {e}")
 
+        # Start Trade Council 2.0 (real-time adversarial signal evaluation)
+        if self._mode == "run" and settings.trade_council_enabled:
+            try:
+                from hean.council.trade_council import TradeCouncil
+
+                self._trade_council = TradeCouncil(
+                    bus=self._bus,
+                    entry_threshold=settings.trade_council_entry_threshold,
+                    exit_threshold=settings.trade_council_exit_threshold,
+                    enabled=True,
+                )
+                await self._trade_council.start()
+                logger.info("Trade Council 2.0 started")
+            except Exception as e:
+                logger.warning(f"Could not start Trade Council: {e}")
+
         # ARCHON — Central Brain-Orchestrator
         if settings.archon_enabled:
             try:
@@ -1177,6 +1195,20 @@ class TradingSystem:
             except Exception as e:
                 logger.error(f"[ARCHON] Failed to start: {e}", exc_info=True)
                 self._archon = None
+
+        # Risk-First: publish the initial RiskEnvelope NOW that all strategies
+        # have called start() and subscribed to RISK_ENVELOPE events.
+        #
+        # RACE CONDITION FIXED: RiskSentinel.start() (called ~line 856) deliberately
+        # defers the initial publish.  If it published immediately, strategies that
+        # hadn't started yet would miss it and begin running with _risk_envelope=None,
+        # causing every early signal to be treated as "no risk limits known" and
+        # either silently rejected or passed through without proper sizing.
+        if self._risk_sentinel is not None:
+            try:
+                await self._risk_sentinel.publish_initial_envelope()
+            except Exception as e:
+                logger.warning(f"RiskSentinel initial envelope publish failed: {e}")
 
         self._running = True
         logger.info("Trading system started")
@@ -1196,6 +1228,10 @@ class TradingSystem:
         # Stop AI Council
         if self._council:
             await self._council.stop()
+
+        # Stop Trade Council
+        if self._trade_council:
+            await self._trade_council.stop()
 
         # Stop improvement catalyst
         if self._improvement_catalyst:
@@ -1433,6 +1469,53 @@ class TradingSystem:
         self._signals_generated += 1
         metrics.increment("signals_generated_total")
 
+        # === 2.5 Trade Council evaluation (adversarial pre-trade vote) ===
+        if self._trade_council:
+            # Feed fresh strategy metrics to council
+            try:
+                s_metrics = self._accounting.get_strategy_metrics() or {}
+                self._trade_council.update_strategy_metrics(s_metrics)
+            except Exception:
+                pass
+            signal_data = {
+                "signal_id": f"{signal.strategy_id}_{signal.symbol}_{event.timestamp.isoformat()}",
+                "strategy_id": signal.strategy_id,
+                "symbol": signal.symbol,
+                "side": signal.side,
+                "entry_price": signal.entry_price,
+                "stop_loss": signal.stop_loss,
+                "take_profit": signal.take_profit,
+                "confidence": signal.confidence,
+                "urgency": signal.urgency,
+                "spread_bps": (signal.metadata or {}).get("spread_bps"),
+                "funding_rate": (signal.metadata or {}).get("funding_rate"),
+                "metadata": signal.metadata or {},
+            }
+            verdict = self._trade_council.evaluate(signal_data)
+            if not verdict.approved:
+                reason = "COUNCIL_VETOED" if verdict.vetoed else "COUNCIL_REJECTED"
+                no_trade_report.increment("trade_council_block", signal.symbol, signal.strategy_id)
+                await self._emit_order_decision(
+                    signal=signal,
+                    decision="REJECT",
+                    reason_code=reason,
+                    computed_qty=None,
+                    context={
+                        "council_confidence": verdict.final_confidence,
+                        "vetoed_by": verdict.vetoed_by,
+                        "votes": [
+                            {"agent": v.agent_role, "confidence": v.confidence, "reasoning": v.reasoning}
+                            for v in verdict.votes
+                        ],
+                    },
+                )
+                return
+            # Attach verdict to signal metadata for downstream use
+            if signal.metadata is None:
+                signal.metadata = {}
+            signal.metadata["council_confidence"] = verdict.final_confidence
+            signal.metadata["council_signal_id"] = verdict.signal_id
+
         # === 3. Get current price ===
         current_price = signal.entry_price or self._regime_detector.get_price(signal.symbol)
         if not current_price or current_price <= 0:
@@ -1605,7 +1688,8 @@ class TradingSystem:
             "applied_leverage": applied_leverage,
         }
 
-        signal_id = str(uuid.uuid4())
+        # Use council signal_id for post-trade reputation tracking if available
+        signal_id = (signal.metadata or {}).get("council_signal_id") or str(uuid.uuid4())
         order_request = OrderRequest(
             signal_id=signal_id,
             strategy_id=signal.strategy_id,
@@ -3857,7 +3941,12 @@ def main() -> None:
 
     if args.command == "run":
         system = TradingSystem()
-        loop = asyncio.get_event_loop()
+        # Create a fresh event loop explicitly.  asyncio.get_event_loop() is
+        # deprecated in Python 3.10+ (and raises DeprecationWarning / RuntimeError
+        # in 3.12+) when called at the top level without a current loop set.
+        # asyncio.new_event_loop() + set_event_loop() is the correct pattern.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
         # Handle signals for graceful shutdown
         def signal_handler(sig, frame):
