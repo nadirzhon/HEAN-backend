@@ -2,10 +2,13 @@
 
 from hean.api.routers import (
     analytics,
+    auth_management,
     brain,
     causal_inference,
     changelog,
+    config,
     engine,
+    experiments,
     graph_engine,
     market,
     meta_learning,
@@ -24,10 +27,13 @@ from hean.api.routers import (
 
 __all__ = [
     "analytics",
+    "auth_management",
     "brain",
     "causal_inference",
     "changelog",
+    "config",
     "engine",
+    "experiments",
     "graph_engine",
     "market",
     "meta_learning",

@@ -5,7 +5,62 @@ import os
 from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+# ---------------------------------------------------------------------------
+# Hot-reload whitelists
+# ---------------------------------------------------------------------------
+
+# Keys in this set may be updated at runtime via the ConfigWatcher / Redis
+# pub/sub channel without restarting the process.  Only non-sensitive,
+# operationally safe parameters are included.
+SAFE_RELOAD_KEYS: frozenset[str] = frozenset(
+    {
+        # Strategy enables
+        "impulse_engine_enabled",
+        "funding_harvester_enabled",
+        "basis_arbitrage_enabled",
+        "hf_scalping_enabled",
+        "enhanced_grid_enabled",
+        "momentum_trader_enabled",
+        "correlation_arb_enabled",
+        "sentiment_strategy_enabled",
+        "inventory_neutral_mm_enabled",
+        "rebate_farmer_enabled",
+        "liquidity_sweep_enabled",
+        # Risk thresholds
+        "max_daily_drawdown_pct",
+        "max_trade_risk_pct",
+        "max_open_positions",
+        "killswitch_drawdown_pct",
+        "consecutive_losses_limit",
+        # Intervals
+        "brain_analysis_interval",
+        "ollama_sentiment_interval",
+        # Feature flags
+        "symbiont_x_enabled",
+        "risk_sentinel_enabled",
+        "intelligence_gate_enabled",
+        "intelligence_gate_reject_on_contradiction",
+    }
+)
+
+# Keys that must NEVER be updated via hot-reload regardless of any whitelist.
+# This set acts as a hard security boundary.
+BLOCKED_KEYS: frozenset[str] = frozenset(
+    {
+        "bybit_api_key",
+        "bybit_api_secret",
+        "anthropic_api_key",
+        "gemini_api_key",
+        "openai_api_key",
+        "openrouter_api_key",
+        "api_auth_key",
+        "jwt_secret",
+        "redis_url",
+        "initial_capital",
+    }
+)
 
 
 def parse_list_env(value: Any) -> Any:
@@ -447,6 +502,15 @@ class HEANSettings(BaseSettings):
         description="Percentile of recent volatility above which trades are hard-blocked (P99 - extreme levels only)",
     )
 
+    # Exchange selection (multi-exchange abstraction layer)
+    exchange: str = Field(
+        default="bybit",
+        description=(
+            "Exchange to use for trading. Currently supported: 'bybit'. "
+            "Register additional exchanges via ExchangeFactory.register() before startup."
+        ),
+    )
+
     # Bybit API (for future live trading)
     bybit_api_key: str = Field(default="", description="Bybit API key")
     bybit_api_secret: str = Field(default="", description="Bybit API secret")
@@ -467,6 +531,34 @@ class HEANSettings(BaseSettings):
     anthropic_api_key: str = Field(default="", description="Anthropic API key for Claude Brain analysis")
     brain_analysis_interval: int = Field(default=60, gt=5, description="Brain analysis interval in seconds")
     brain_enabled: bool = Field(default=True, description="Enable Claude Brain analysis module")
+
+    # Sovereign Brain (independent, no Anthropic dependency)
+    sovereign_brain_enabled: bool = Field(
+        default=False,
+        description="Force SovereignBrain even if anthropic_api_key is present",
+    )
+    groq_api_key: str = Field(default="", description="Groq API key (Llama-3.3-70B, free tier 14k req/day)")
+    deepseek_api_key: str = Field(default="", description="DeepSeek API key (deepseek-reasoner, $0.55/M tokens)")
+    brain_local_model: str = Field(
+        default="deepseek-r1:14b",
+        description="Ollama model for SovereignBrain local analysis (default: deepseek-r1:14b)",
+    )
+    coinglass_api_key: str = Field(default="", description="CoinGlass API key (OI, liquidations, L/S ratio)")
+    glassnode_api_key: str = Field(default="", description="Glassnode API key (SOPR, MVRV Z-Score, exchange flows)")
+    coingecko_api_key: str = Field(default="", description="CoinGecko API key (BTC dominance, optional)")
+    fred_api_key: str = Field(default="", description="FRED API key (DXY, Fed Funds Rate)")
+    brain_signal_refresh_interval: int = Field(
+        default=300, gt=30,
+        description="How often to refresh data collectors in SovereignBrain (seconds, default 300)",
+    )
+    brain_ensemble_threshold: float = Field(
+        default=0.55, ge=0.30, le=0.95,
+        description="Minimum weighted-score magnitude to emit a directional signal (default 0.55)",
+    )
+    brain_accuracy_tracking: bool = Field(
+        default=True,
+        description="Enable Brier Score accuracy tracking with DuckDB persistence",
+    )
 
     # Ollama Sentiment (local LLM, free, no API key required)
     ollama_enabled: bool = Field(
@@ -632,6 +724,12 @@ class HEANSettings(BaseSettings):
         description="Below this confidence, consider early exit (0-1)",
     )
 
+    # ── Temporal Event Fabric ─────────────────────────────────────────
+    fabric_enabled: bool = Field(
+        default=True,
+        description="Enable Temporal Event Fabric (Event DNA + EEV scoring)",
+    )
+
     self_insight_enabled: bool = Field(
         default=True,
         description="Enable self-telemetry collection for Brain/Council analysis",
@@ -651,6 +749,16 @@ class HEANSettings(BaseSettings):
         default="",
         description="API key for authentication (generate with: python -c 'import secrets; print(secrets.token_hex(32))')",
     )
+    api_auth_key_grace_period: int = Field(
+        default=3600,
+        gt=0,
+        description=(
+            "Grace period in seconds for the old API key after rotation. "
+            "During this window the old key is stored in Redis under "
+            "'hean:auth:secondary_key' and is accepted alongside the new primary key. "
+            "Requests using the old key receive X-Key-Deprecated: true."
+        ),
+    )
     jwt_secret: str = Field(
         default="",
         description="JWT secret for token signing (auto-generated if not set)",
@@ -668,7 +776,27 @@ class HEANSettings(BaseSettings):
             return ["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173"]
         return parse_list_env(v)
 
-    # Observability
+    # Observability — OpenTelemetry distributed tracing
+    otel_enabled: bool = Field(
+        default=False,
+        description="Enable OpenTelemetry distributed tracing (requires opentelemetry-sdk installed)",
+    )
+    otel_endpoint: str = Field(
+        default="http://localhost:4317",
+        description="OTLP gRPC collector endpoint (Jaeger all-in-one default: http://localhost:4317)",
+    )
+    otel_service_name: str = Field(
+        default="hean",
+        description="Service name emitted in trace spans (visible in Jaeger UI)",
+    )
+    otel_sample_rate: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of traces to sample (1.0=100%, 0.1=10%). Uses ParentBased sampler.",
+    )
+
+    # Observability — logging
     log_level: str = Field(default="INFO", description="Logging level")
     log_format: str = Field(
         default="text",
@@ -1161,6 +1289,138 @@ class HEANSettings(BaseSettings):
     archon_chronicle_max_memory: int = Field(
         default=10000, description="Max in-memory chronicle entries"
     )
+
+    # ------------------------------------------------------------------
+    # Secrets integration — highest-priority settings source
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Inject SecretsManager as the highest-priority configuration source.
+
+        Resolution order (first match wins):
+        1. SecretsManager   — Docker secrets, K8s secrets, env-var fallback
+        2. env_settings     — standard environment variables (pydantic-settings)
+        3. dotenv_settings  — .env file (pydantic-settings)
+        4. init_settings    — values passed to HEANSettings() constructor
+
+        Sensitive fields resolved through SecretsManager:
+            ``bybit_api_key``, ``bybit_api_secret``, ``anthropic_api_key``,
+            ``api_auth_key``, ``gemini_api_key``, ``openai_api_key``,
+            ``openrouter_api_key``, ``jwt_secret``
+        """
+        # Import here to avoid circular imports at module level (config.py is
+        # imported very early; secrets.py imports hean.logging which may import
+        # config.py indirectly in some code paths).
+        from hean.core.secrets import SecretsSettingsSource, secrets as _secrets_mgr
+
+        _SENSITIVE_FIELDS: tuple[str, ...] = (
+            "bybit_api_key",
+            "bybit_api_secret",
+            "anthropic_api_key",
+            "api_auth_key",
+            "gemini_api_key",
+            "openai_api_key",
+            "openrouter_api_key",
+            "jwt_secret",
+        )
+
+        secrets_source = SecretsSettingsSource(
+            settings_cls=settings_cls,
+            manager=_secrets_mgr,
+            secret_fields=_SENSITIVE_FIELDS,
+        )
+
+        return (
+            secrets_source,   # 1. Docker/K8s/env secrets — highest priority
+            env_settings,     # 2. Plain environment variables
+            dotenv_settings,  # 3. .env file
+            init_settings,    # 4. Constructor kwargs — lowest priority
+        )
+
+    def update_safe(self, updates: dict[str, Any]) -> dict[str, Any]:
+        """Apply a batch of config updates, enforcing the hot-reload whitelist.
+
+        Each key is validated against ``SAFE_RELOAD_KEYS`` and ``BLOCKED_KEYS``.
+        Values are coerced to the declared Pydantic field type before being
+        written via ``object.__setattr__`` (which bypasses the frozen-model
+        guard while still keeping the runtime object mutated in-place).
+
+        Args:
+            updates: Mapping of ``{field_name: new_value}``.
+
+        Returns:
+            Mapping of ``{field_name: new_value}`` containing only the keys
+            that were actually changed (skips unchanged and rejected keys).
+        """
+        import json as _json
+
+        applied: dict[str, Any] = {}
+
+        for key, raw in updates.items():
+            # Hard security boundary – always rejected
+            if key in BLOCKED_KEYS:
+                continue
+
+            # Must be in the whitelist
+            if key not in SAFE_RELOAD_KEYS:
+                continue
+
+            # Unknown field on the model – skip
+            if key not in self.model_fields:
+                continue
+
+            field_info = self.model_fields[key]
+            annotation = field_info.annotation
+
+            # Attempt type coercion
+            try:
+                origin = getattr(annotation, "__origin__", None)
+                if annotation is bool:
+                    if isinstance(raw, bool):
+                        new_val: Any = raw
+                    elif isinstance(raw, str):
+                        new_val = raw.lower() in ("true", "1", "yes")
+                    else:
+                        new_val = bool(raw)
+                elif annotation is int:
+                    new_val = int(raw)
+                elif annotation is float:
+                    new_val = float(raw)
+                elif annotation is str:
+                    new_val = str(raw)
+                elif origin is list:
+                    if isinstance(raw, list):
+                        new_val = raw
+                    elif isinstance(raw, str):
+                        try:
+                            parsed = _json.loads(raw)
+                            new_val = parsed if isinstance(parsed, list) else [raw]
+                        except _json.JSONDecodeError:
+                            new_val = [item.strip() for item in raw.split(",") if item.strip()]
+                    else:
+                        new_val = list(raw)
+                else:
+                    new_val = raw
+            except (TypeError, ValueError):
+                continue
+
+            # Skip if value is unchanged
+            current = getattr(self, key, None)
+            if new_val == current:
+                continue
+
+            object.__setattr__(self, key, new_val)
+            applied[key] = new_val
+
+        return applied
 
     def model_post_init(self, __context: Any) -> None:
         """Validate trading mode after initialization."""

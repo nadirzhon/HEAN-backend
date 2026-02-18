@@ -5,12 +5,13 @@ Enhanced with:
 - Health monitoring and circuit breaker
 - Adaptive backpressure
 - Metrics for observability
+- Per-event-type latency tracking (P99 window per type)
 """
 
 import asyncio
 import concurrent.futures
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -20,6 +21,39 @@ from hean.core.types import Event, EventType
 from hean.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Optional OpenTelemetry integration — zero-cost when not installed/enabled.
+# We attempt to import at module level so the check happens once.  All tracing
+# calls are guarded by _OTEL_BUS_ENABLED which is False until setup_tracing()
+# has been called (tracer_provider is non-None) AND the packages are installed.
+# ---------------------------------------------------------------------------
+_OTEL_BUS_ENABLED = False
+try:
+    from hean.observability.otel import (
+        _OTEL_AVAILABLE as _otel_pkg_available,
+        extract_trace_context,
+        get_tracer as _get_otel_tracer,
+        inject_trace_context,
+    )
+
+    if _otel_pkg_available:
+        _OTEL_BUS_ENABLED = True
+        _bus_tracer = _get_otel_tracer("hean.core.bus")
+    else:
+        _bus_tracer = None
+except Exception:
+    _bus_tracer = None
+
+# Sentinel key used to embed/extract W3C trace context from event data dicts.
+_TRACE_CTX_KEY = "_trace_context"
+
+# High-volume event types where per-dispatch child spans would add too much
+# overhead.  For these types we still inject context on the publisher side
+# but skip creating a span on the consumer side to keep tracing overhead low.
+_TRACE_SKIP_DISPATCH_TYPES: frozenset[EventType] = frozenset(
+    {EventType.TICK, EventType.HEARTBEAT}
+)
 
 # Fast-path events that bypass the queue for minimal latency
 FAST_PATH_EVENTS = {EventType.SIGNAL, EventType.ORDER_REQUEST, EventType.ORDER_FILLED, EventType.ENRICHED_SIGNAL}
@@ -59,6 +93,26 @@ EVENT_PRIORITY_MAP: dict[EventType, EventPriority] = {
 
 
 @dataclass
+class EventTypeMetrics:
+    """Per-event-type latency tracking."""
+    count: int = 0
+    total_ms: float = 0.0
+    p99_window: deque = field(default_factory=lambda: deque(maxlen=200))
+
+    @property
+    def avg_ms(self) -> float:
+        return self.total_ms / self.count if self.count > 0 else 0.0
+
+    @property
+    def p99_ms(self) -> float:
+        if not self.p99_window:
+            return 0.0
+        sorted_times = sorted(self.p99_window)
+        idx = int(len(sorted_times) * 0.99)
+        return sorted_times[min(idx, len(sorted_times) - 1)] * 1000
+
+
+@dataclass
 class BusHealthStatus:
     """Health status of the EventBus."""
     is_healthy: bool = True
@@ -80,25 +134,52 @@ class EventBus:
     - Circuit breaker to prevent cascade failures
     - Health monitoring with degraded/unhealthy states
     - Adaptive backpressure based on queue utilization
+    - Per-event-type latency metrics (avg + P99)
+    - asyncio.Event-based idle wait (no task-creation leak)
     """
 
-    # Circuit breaker thresholds
+    # Circuit breaker thresholds (defaults; overridden by settings or constructor)
     CIRCUIT_OPEN_THRESHOLD = 0.95  # Open circuit at 95% queue utilization
     CIRCUIT_CLOSE_THRESHOLD = 0.70  # Close circuit at 70% utilization
     DEGRADED_THRESHOLD = 0.80  # Mark as degraded at 80% utilization
 
-    def __init__(self, max_queue_size: int = 50000) -> None:
+    def __init__(
+        self,
+        max_queue_size: int | None = None,
+        circuit_open_threshold: float | None = None,
+        circuit_close_threshold: float | None = None,
+    ) -> None:
         """Initialize the event bus.
 
         Args:
-            max_queue_size: Maximum queue size to prevent memory leaks (default 50000)
+            max_queue_size: Maximum queue size (default from settings or 50000)
+            circuit_open_threshold: Override circuit-open utilization threshold
+            circuit_close_threshold: Override circuit-close utilization threshold
         """
+        # Load settings with graceful fallback so EventBus can be constructed
+        # before settings are fully initialised (e.g. in unit tests).
+        try:
+            from hean.config import settings as _settings
+            _max_q = max_queue_size if max_queue_size is not None else _settings.bus_max_queue_size
+            _open_th = circuit_open_threshold if circuit_open_threshold is not None else _settings.bus_circuit_open_threshold
+            _close_th = circuit_close_threshold if circuit_close_threshold is not None else _settings.bus_circuit_close_threshold
+            _degraded_th = _settings.bus_degraded_threshold
+        except Exception:
+            _max_q = max_queue_size if max_queue_size is not None else 50000
+            _open_th = circuit_open_threshold if circuit_open_threshold is not None else 0.95
+            _close_th = circuit_close_threshold if circuit_close_threshold is not None else 0.70
+            _degraded_th = 0.80
+
+        self.CIRCUIT_OPEN_THRESHOLD = _open_th
+        self.CIRCUIT_CLOSE_THRESHOLD = _close_th
+        self.DEGRADED_THRESHOLD = _degraded_th
+
         self._subscribers: dict[EventType, list[Callable[[Event], Any]]] = defaultdict(list)
 
         # Multi-priority queues
-        self._critical_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=max_queue_size // 5)
-        self._normal_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=max_queue_size // 2)
-        self._low_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=max_queue_size)
+        self._critical_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_max_q // 5)
+        self._normal_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_max_q // 2)
+        self._low_queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_max_q)
 
         # Legacy queue for backwards compatibility
         self._queue: asyncio.Queue[Event] = self._normal_queue
@@ -123,10 +204,14 @@ class EventBus:
         self._last_health_check = time.time()
         self._health_check_interval = 5.0  # Check every 5 seconds
 
-        # Rate tracking for metrics
-        self._events_last_second: list[float] = []
-        self._processing_times: list[float] = []
-        self._max_processing_samples = 100
+        # Rate tracking for metrics — bounded deque (max 10k entries)
+        self._events_last_second: deque[float] = deque(maxlen=10000)
+
+        # Per-event-type latency metrics (replaces flat _processing_times list)
+        self._per_type_metrics: dict[EventType, EventTypeMetrics] = defaultdict(EventTypeMetrics)
+
+        # asyncio.Event for idle-wait signalling (created in start() within running loop)
+        self._new_event_signal: asyncio.Event | None = None
 
         # Metrics for monitoring overflow
         self._metrics = {
@@ -177,19 +262,22 @@ class EventBus:
         self._last_health_check = now
         utilization = self._get_total_queue_utilization()
 
-        # Calculate events per second
+        # Calculate events per second — trim stale entries from bounded deque
         cutoff = now - 1.0
-        self._events_last_second = [t for t in self._events_last_second if t > cutoff]
+        while self._events_last_second and self._events_last_second[0] <= cutoff:
+            self._events_last_second.popleft()
         events_per_second = len(self._events_last_second)
 
         # Calculate drop rate
         total_attempted = self._metrics["events_published"] + self._metrics["events_dropped"]
         drop_rate = (self._metrics["events_dropped"] / total_attempted * 100) if total_attempted > 0 else 0.0
 
-        # Calculate avg processing time
+        # Calculate avg processing time across all tracked event types
         avg_processing_ms = 0.0
-        if self._processing_times:
-            avg_processing_ms = sum(self._processing_times) / len(self._processing_times) * 1000
+        if self._per_type_metrics:
+            all_avgs = [m.avg_ms for m in self._per_type_metrics.values() if m.count > 0]
+            if all_avgs:
+                avg_processing_ms = sum(all_avgs) / len(all_avgs)
 
         # Update health status
         self._health = BusHealthStatus(
@@ -267,11 +355,24 @@ class EventBus:
         Circuit breaker: When queue utilization exceeds 95%, LOW priority events
         are dropped until utilization drops below 70%.
         """
-        # Track event rate
+        # Track event rate (bounded deque, so no unbounded growth)
         self._events_last_second.append(time.time())
 
         # Update health status periodically
         self._update_health_status()
+
+        # ------------------------------------------------------------------
+        # Trace context injection: embed current span into event data so
+        # downstream handlers can create child spans that continue the trace.
+        # We only do this when OTEL is available AND the event data is a dict.
+        # The injection is a shallow dict mutation — no copy, no allocation
+        # when OTEL is disabled (_OTEL_BUS_ENABLED is False at module level).
+        # ------------------------------------------------------------------
+        if _OTEL_BUS_ENABLED and isinstance(event.data, dict):
+            try:
+                event.data[_TRACE_CTX_KEY] = inject_trace_context()
+            except Exception:
+                pass  # Tracing must never block trading
 
         # Fast-path for time-critical events
         if event.event_type in FAST_PATH_EVENTS:
@@ -300,6 +401,9 @@ class EventBus:
             queue.put_nowait(event)
             self._metrics["events_published"] += 1
             self._metrics[f"{priority.name.lower()}_queue_published"] += 1
+            # Signal the processing loop that work is available
+            if self._new_event_signal is not None:
+                self._new_event_signal.set()
         except asyncio.QueueFull:
             queue_size = queue.qsize()
 
@@ -321,6 +425,8 @@ class EventBus:
                     self._metrics["events_delayed"] += 1
                     self._metrics["events_published"] += 1
                     self._metrics["critical_queue_published"] += 1
+                    if self._new_event_signal is not None:
+                        self._new_event_signal.set()
                     logger.warning(
                         f"[EventBus] CRITICAL queue was full. Backpressured {event.event_type}. "
                         f"Delayed: {self._metrics['events_delayed']} total"
@@ -344,6 +450,8 @@ class EventBus:
                     self._metrics["events_delayed"] += 1
                     self._metrics["events_published"] += 1
                     self._metrics["normal_queue_published"] += 1
+                    if self._new_event_signal is not None:
+                        self._new_event_signal.set()
                     logger.warning(
                         f"[EventBus] NORMAL queue was full. Backpressured {event.event_type}. "
                         f"Delayed: {self._metrics['events_delayed']} total"
@@ -361,6 +469,9 @@ class EventBus:
 
         Priority order: CRITICAL > NORMAL > LOW
         Critical events are always processed first.
+
+        Uses asyncio.Event for idle-wait instead of spawning tasks, preventing
+        a 2-3 task-per-second leak when queues are empty.
         """
         while self._running:
             try:
@@ -392,54 +503,32 @@ class EventBus:
                         except asyncio.QueueEmpty:
                             break
 
-                # If no events, wait for any queue
+                # If no events, wait for signal instead of creating tasks
                 if not batch:
-                    try:
-                        # Wait on all queues using asyncio.wait
-                        wait_tasks = [
-                            asyncio.create_task(self._critical_queue.get()),
-                            asyncio.create_task(self._normal_queue.get()),
-                        ]
-                        if not self._circuit_open:
-                            wait_tasks.append(asyncio.create_task(self._low_queue.get()))
-
-                        done, pending = await asyncio.wait(
-                            wait_tasks,
-                            timeout=1.0,
-                            return_when=asyncio.FIRST_COMPLETED
-                        )
-
-                        # Cancel pending tasks
-                        for task in pending:
-                            task.cancel()
-                            try:
-                                await task
-                            except (asyncio.CancelledError, asyncio.QueueEmpty):
-                                pass
-
-                        # Get completed events
-                        for task in done:
-                            try:
-                                event = task.result()
-                                batch.append(event)
-                            except (asyncio.CancelledError, asyncio.QueueEmpty):
-                                pass
-
-                    except TimeoutError:
-                        continue
+                    if self._new_event_signal is not None:
+                        try:
+                            await asyncio.wait_for(self._new_event_signal.wait(), timeout=1.0)
+                            self._new_event_signal.clear()
+                        except TimeoutError:
+                            pass
+                    else:
+                        # Fallback if signal not yet initialised
+                        await asyncio.sleep(0.01)
+                    continue
 
                 # Dispatch all events in batch concurrently
-                if batch:
-                    tasks = [self._dispatch(event) for event in batch]
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    self._metrics["events_processed"] += len(batch)
-                    self._metrics["queued_dispatched"] += len(batch)
+                tasks = [self._dispatch(event) for event in batch]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self._metrics["events_processed"] += len(batch)
+                self._metrics["queued_dispatched"] += len(batch)
 
-                    # Track processing time
-                    processing_time = time.time() - start_time
-                    self._processing_times.append(processing_time)
-                    if len(self._processing_times) > self._max_processing_samples:
-                        self._processing_times.pop(0)
+                # Track per-event-type latency
+                elapsed = time.time() - start_time
+                for event in batch:
+                    metrics = self._per_type_metrics[event.event_type]
+                    metrics.count += 1
+                    metrics.total_ms += elapsed * 1000
+                    metrics.p99_window.append(elapsed)
 
             except asyncio.CancelledError:
                 # CRITICAL FIX: CancelledError must be re-raised, not caught
@@ -456,7 +545,14 @@ class EventBus:
                 await self._dispatch(error_event)
 
     async def _dispatch(self, event: Event) -> None:
-        """Dispatch event to all subscribers."""
+        """Dispatch event to all subscribers.
+
+        When OpenTelemetry is active, extracts the W3C trace context that was
+        injected by the publisher and wraps the entire handler dispatch inside a
+        child span named ``eventbus.dispatch.<EVENT_TYPE>``.  High-volume events
+        (TICK, HEARTBEAT) skip the child span to limit overhead but their context
+        is still propagated so manual instrumentation in handlers works correctly.
+        """
         handlers = self._subscribers.get(event.event_type, [])
         if not handlers:
             logger.warning(f"No subscribers for {event.event_type}")
@@ -469,9 +565,40 @@ class EventBus:
             return
 
         logger.debug(f"Dispatching {event.event_type} to {len(handlers)} handlers")
-        # Dispatch to all handlers concurrently
-        tasks = [self._safe_call_handler(handler, event) for handler in handlers]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # ------------------------------------------------------------------
+        # Trace context extraction and child-span creation (OTEL path)
+        # ------------------------------------------------------------------
+        if (
+            _OTEL_BUS_ENABLED
+            and _bus_tracer is not None
+            and isinstance(event.data, dict)
+            and event.event_type not in _TRACE_SKIP_DISPATCH_TYPES
+        ):
+            try:
+                carrier = event.data.get(_TRACE_CTX_KEY)
+                parent_ctx = extract_trace_context(carrier)
+                span_name = f"eventbus.dispatch.{event.event_type.value}"
+                with _bus_tracer.start_as_current_span(span_name, context=parent_ctx) as span:
+                    try:
+                        span.set_attribute("event.type", event.event_type.value)
+                        span.set_attribute("event.handlers", len(handlers))
+                        # Propagate symbol if present for easier trace filtering
+                        sym = event.data.get("symbol")
+                        if sym:
+                            span.set_attribute("trading.symbol", str(sym))
+                    except Exception:
+                        pass
+                    tasks = [self._safe_call_handler(handler, event) for handler in handlers]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                # Tracing failure must never suppress event dispatch — fall through.
+                tasks = [self._safe_call_handler(handler, event) for handler in handlers]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            # Non-OTEL path — identical to original behaviour.
+            tasks = [self._safe_call_handler(handler, event) for handler in handlers]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Log any exceptions from handlers
         for i, result in enumerate(results):
@@ -492,8 +619,12 @@ class EventBus:
             if asyncio.iscoroutinefunction(handler):
                 await handler(event)
             else:
-                # CRITICAL: Sync handlers must run in thread pool to avoid blocking event loop
-                loop = asyncio.get_event_loop()
+                # CRITICAL: Sync handlers must run in thread pool to avoid blocking event loop.
+                # Use get_running_loop() — we are always inside a running loop here since this
+                # coroutine is only ever awaited from _safe_call_handler which runs under asyncio.
+                # get_event_loop() is deprecated in Python 3.10+ and raises RuntimeError in 3.12+
+                # when called from a running loop that was not started by the current thread.
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(self._executor, handler, event)
             logger.debug(f"Handler {handler.__name__} completed successfully")
         except Exception as e:
@@ -507,6 +638,8 @@ class EventBus:
         if self._running:
             return
         self._running = True
+        # Create asyncio.Event within the running event loop to avoid cross-loop issues
+        self._new_event_signal = asyncio.Event()
         self._task = asyncio.create_task(self._process_events())
         logger.info("Event bus started")
 
@@ -556,6 +689,10 @@ class EventBus:
 
         logger.info("[EventBus] Stopping...")
         self._running = False
+
+        # Unblock the idle-wait signal so the loop exits quickly
+        if self._new_event_signal is not None:
+            self._new_event_signal.set()
 
         # Cancel the processing task explicitly
         if self._task:
@@ -613,6 +750,7 @@ class EventBus:
             - queue sizes and utilization per priority
             - circuit breaker state
             - health status
+            - per_type_latency: Per-event-type avg and P99 latency in ms
         """
         health = self.get_health()
 
@@ -638,6 +776,16 @@ class EventBus:
             "events_per_second": health.events_per_second,
             "drop_rate_pct": health.drop_rate_pct,
             "avg_processing_time_ms": health.avg_processing_time_ms,
+            # Per-event-type latency (P99 + avg) — only populated types
+            "per_type_latency": {
+                et.value: {
+                    "count": m.count,
+                    "avg_ms": round(m.avg_ms, 3),
+                    "p99_ms": round(m.p99_ms, 3),
+                }
+                for et, m in self._per_type_metrics.items()
+                if m.count > 0
+            },
         }
 
     async def events(self, event_type: EventType) -> AsyncIterator[Event]:

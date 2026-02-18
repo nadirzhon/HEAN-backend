@@ -20,7 +20,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from hean.api.auth import setup_auth
+from hean.api.auth import set_middleware_redis, setup_auth
 from hean.api.engine_facade import EngineFacade
 from hean.api.schemas import WebSocketMessage
 from hean.api.services.market_data_store import market_data_store
@@ -300,6 +300,48 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for FastAPI app."""
     global engine_facade, bus, redis_state_manager, websocket_service, killswitch, heartbeat_task
 
+    # ------------------------------------------------------------------
+    # OpenTelemetry distributed tracing (optional — gated by config flag)
+    # ------------------------------------------------------------------
+    _otel_active = False
+    if settings.otel_enabled:
+        try:
+            from hean.observability.otel import (
+                instrument_fastapi,
+                instrument_redis,
+                is_available,
+                setup_tracing,
+            )
+
+            if is_available():
+                setup_tracing(
+                    service_name=settings.otel_service_name,
+                    endpoint=settings.otel_endpoint,
+                    sample_rate=settings.otel_sample_rate,
+                )
+                instrument_fastapi(app)
+                instrument_redis()  # class-level instrumentation for all Redis clients
+                _otel_active = True
+                logger.info(
+                    "OTEL_INIT_OK",
+                    extra={
+                        "service": settings.otel_service_name,
+                        "endpoint": settings.otel_endpoint,
+                        "sample_rate": settings.otel_sample_rate,
+                    },
+                )
+            else:
+                logger.warning(
+                    "OTEL_INIT_SKIP: otel_enabled=true but opentelemetry packages "
+                    "are not installed. Install with: pip install opentelemetry-sdk "
+                    "opentelemetry-exporter-otlp-proto-grpc "
+                    "opentelemetry-instrumentation-fastapi "
+                    "opentelemetry-instrumentation-redis"
+                )
+        except Exception as _otel_exc:
+            # OTEL failure must never block startup.
+            logger.warning(f"OTEL_INIT_FAIL: {_otel_exc} — tracing disabled", exc_info=True)
+
     # Initialize event bus
     logger.info("ENGINE_FACADE_INIT_START")
     bus = EventBus()
@@ -336,6 +378,8 @@ async def lifespan(app: FastAPI):
             # Test connection
             await redis_state_manager._client.ping()
             app.state.redis_state_manager = redis_state_manager
+            # Give AuthMiddleware access to Redis for secondary-key lookups.
+            set_middleware_redis(redis_state_manager._client)
             logger.info("REDIS_CHECK_OK: connected to redis:6379")
             break
         except Exception as e:
@@ -359,6 +403,20 @@ async def lifespan(app: FastAPI):
 
     # Start background tasks with safe wrappers (auto-restart on failure)
     asyncio.create_task(safe_task_wrapper(forward_events_to_topics, "forward_events"))
+
+    # Start ConfigWatcher: listens to hean:config:update Redis channel and
+    # applies hot-reload config changes to the global settings singleton.
+    if redis_state_manager:
+        try:
+            from hean.core.config_watcher import ConfigWatcher
+            _config_watcher = ConfigWatcher(settings=settings, bus=bus)
+            await _config_watcher.start()
+            logger.info("CONFIG_WATCHER_START_OK")
+        except Exception as _cw_exc:
+            logger.warning(
+                f"CONFIG_WATCHER_START_FAIL: {_cw_exc} – hot-reload disabled",
+                exc_info=True,
+            )
 
     # Start background task to forward Redis pub/sub to WebSocket topics
     if redis_state_manager:
@@ -504,6 +562,15 @@ async def lifespan(app: FastAPI):
     # Wait for cancelled tasks to complete
     if shutdown_tasks:
         await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+
+    # 6. Flush OpenTelemetry spans before process exit
+    if _otel_active:
+        try:
+            from hean.observability.otel import shutdown_tracing
+            shutdown_tracing()
+            logger.info("OTEL_SHUTDOWN_OK: all spans flushed")
+        except Exception as _otel_shutdown_exc:
+            logger.warning(f"OTEL_SHUTDOWN_FAIL: {_otel_shutdown_exc}")
 
     logger.info("✅ Graceful shutdown complete")
 
@@ -1410,11 +1477,14 @@ async def add_request_id(request: Request, call_next):
 from hean.api.routers import (  # noqa: E402
     analytics,
     archon,
+    auth_management,
     brain,
     causal_inference,
     changelog,
+    config as config_router_module,
     council,
     engine,
+    experiments,
     graph_engine,
     market,
     meta_brain,
@@ -1435,6 +1505,8 @@ from hean.api.routers import (  # noqa: E402
 API_PREFIX = "/api/v1"
 
 app.include_router(archon.router, prefix=API_PREFIX)
+app.include_router(auth_management.router, prefix=f"{API_PREFIX}/auth", tags=["auth"])
+app.include_router(config_router_module.router, prefix=API_PREFIX)
 app.include_router(engine.router, prefix=API_PREFIX)
 app.include_router(trading.router, prefix=API_PREFIX)
 app.include_router(trading.why_router, prefix=API_PREFIX)
@@ -1457,6 +1529,7 @@ app.include_router(brain.router, prefix=API_PREFIX)
 app.include_router(storage.router, prefix=API_PREFIX)
 app.include_router(council.router, prefix=API_PREFIX)
 app.include_router(meta_brain.router, prefix=API_PREFIX)
+app.include_router(experiments.router, prefix=f"{API_PREFIX}/experiments", tags=["experiments"])
 
 
 # Prometheus metrics endpoint (no prefix — Prometheus scrapes /metrics directly)
