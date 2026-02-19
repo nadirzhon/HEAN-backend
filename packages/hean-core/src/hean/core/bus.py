@@ -22,6 +22,24 @@ from hean.logging import get_logger
 
 logger = get_logger(__name__)
 
+try:
+    from hean.core.bus_middleware import MiddlewarePipeline, ValidationMiddleware, LoggingMiddleware, MetricsMiddleware
+    _MIDDLEWARE_AVAILABLE = True
+except ImportError:
+    _MIDDLEWARE_AVAILABLE = False
+
+try:
+    from hean.core.bus_dlq import DeadLetterQueue
+    _DLQ_AVAILABLE = True
+except ImportError:
+    _DLQ_AVAILABLE = False
+
+try:
+    from hean.core.handler_circuit_breaker import HandlerCircuitBreaker, CircuitBreakerRegistry
+    _CB_AVAILABLE = True
+except ImportError:
+    _CB_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Optional OpenTelemetry integration — zero-cost when not installed/enabled.
 # We attempt to import at module level so the check happens once.  All tracing
@@ -164,11 +182,25 @@ class EventBus:
             _open_th = circuit_open_threshold if circuit_open_threshold is not None else _settings.bus_circuit_open_threshold
             _close_th = circuit_close_threshold if circuit_close_threshold is not None else _settings.bus_circuit_close_threshold
             _degraded_th = _settings.bus_degraded_threshold
+            _enable_middleware = _settings.enable_bus_middleware
+            _dlq_maxsize = _settings.dlq_maxsize
+            _dlq_max_retries = _settings.dlq_max_retries
+            _enable_cb = _settings.enable_handler_circuit_breaker
+            _cb_failure_threshold = _settings.handler_cb_failure_threshold
+            _cb_timeout_ms = _settings.handler_cb_timeout_ms
+            _cb_recovery_s = _settings.handler_cb_recovery_timeout_s
         except Exception:
             _max_q = max_queue_size if max_queue_size is not None else 50000
             _open_th = circuit_open_threshold if circuit_open_threshold is not None else 0.95
             _close_th = circuit_close_threshold if circuit_close_threshold is not None else 0.70
             _degraded_th = 0.80
+            _enable_middleware = True
+            _dlq_maxsize = 1000
+            _dlq_max_retries = 3
+            _enable_cb = False
+            _cb_failure_threshold = 5
+            _cb_timeout_ms = 500
+            _cb_recovery_s = 30.0
 
         self.CIRCUIT_OPEN_THRESHOLD = _open_th
         self.CIRCUIT_CLOSE_THRESHOLD = _close_th
@@ -227,6 +259,29 @@ class EventBus:
             "low_queue_published": 0,
             "circuit_breaker_trips": 0,
         }
+
+        # --- Middleware pipeline (optional) ---
+        self._middleware: Any = None
+        self._metrics_mw: Any = None
+        if _enable_middleware and _MIDDLEWARE_AVAILABLE:
+            self._middleware = MiddlewarePipeline()
+            self._middleware.add(ValidationMiddleware(), priority=100)
+            self._middleware.add(LoggingMiddleware(), priority=50)
+            self._metrics_mw = MetricsMiddleware()
+            self._middleware.add(self._metrics_mw, priority=10)
+
+        # --- Dead Letter Queue ---
+        if _DLQ_AVAILABLE:
+            self._dlq: Any = DeadLetterQueue(maxsize=_dlq_maxsize, max_retries=_dlq_max_retries)
+        else:
+            self._dlq = None
+
+        # --- Handler Circuit Breaker ---
+        self._cb_enabled = _enable_cb and _CB_AVAILABLE
+        self._cb_failure_threshold = _cb_failure_threshold
+        self._cb_timeout_ms = _cb_timeout_ms
+        self._cb_recovery_s = _cb_recovery_s
+        self._cb_registry = CircuitBreakerRegistry.instance() if self._cb_enabled else None
 
     def _get_queue_for_event(self, event: Event) -> tuple[asyncio.Queue[Event], EventPriority]:
         """Get the appropriate queue for an event based on its priority."""
@@ -320,10 +375,38 @@ class EventBus:
         self._update_health_status()
         return self._health
 
-    def subscribe(self, event_type: EventType, handler: Callable[[Event], Any]) -> None:
-        """Subscribe a handler to an event type."""
-        self._subscribers[event_type].append(handler)
-        logger.debug(f"Subscribed handler {handler.__name__} to {event_type}")
+    def subscribe(
+        self,
+        event_type: EventType,
+        handler: Callable[[Event], Any],
+        *,
+        wrap_circuit_breaker: bool = False,
+    ) -> None:
+        """Subscribe a handler to an event type.
+
+        Args:
+            event_type: Event type to subscribe to.
+            handler: Handler callable.
+            wrap_circuit_breaker: If True and circuit breakers are enabled,
+                wrap the handler in a HandlerCircuitBreaker.
+        """
+        if wrap_circuit_breaker and self._cb_enabled:
+            name = getattr(handler, '__qualname__', getattr(handler, '__name__', repr(handler)))
+            cb = HandlerCircuitBreaker(
+                handler=handler,
+                name=name,
+                failure_threshold=self._cb_failure_threshold,
+                timeout_ms=self._cb_timeout_ms,
+                recovery_timeout_s=self._cb_recovery_s,
+            )
+            if self._cb_registry is not None:
+                self._cb_registry.register(cb)
+            self._subscribers[event_type].append(cb)
+            logger.debug(f"Subscribed handler {name} to {event_type} (circuit breaker)")
+        else:
+            handler_name = getattr(handler, '__name__', repr(handler))
+            self._subscribers[event_type].append(handler)
+            logger.debug(f"Subscribed handler {handler_name} to {event_type}")
 
     def unsubscribe(self, event_type: EventType, handler: Callable[[Event], Any]) -> None:
         """Unsubscribe a handler from an event type."""
@@ -373,6 +456,15 @@ class EventBus:
                 event.data[_TRACE_CTX_KEY] = inject_trace_context()
             except Exception:
                 pass  # Tracing must never block trading
+
+        # --- Middleware before-publish hook ---
+        if self._middleware is not None:
+            try:
+                event = await self._middleware.run_before(event)
+                if event is None:
+                    return  # Dropped by middleware
+            except Exception:
+                pass  # Middleware failure must never block publishing
 
         # Fast-path for time-critical events
         if event.event_type in FAST_PATH_EVENTS:
@@ -600,14 +692,28 @@ class EventBus:
             tasks = [self._safe_call_handler(handler, event) for handler in handlers]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Log any exceptions from handlers
+        # Log any exceptions from handlers and route to DLQ
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 self._metrics["handler_errors"] += 1
+                handler_name = getattr(handlers[i], '__name__', getattr(handlers[i], '__qualname__', repr(handlers[i])))
                 logger.error(
-                    f"Handler {handlers[i].__name__} raised exception for {event.event_type}: {result}",
+                    f"Handler {handler_name} raised exception for {event.event_type}: {result}",
                     exc_info=result,
                 )
+                # Route critical event failures to Dead Letter Queue
+                if self._dlq is not None:
+                    try:
+                        self._dlq.add(event, result, handler_name=handler_name)
+                    except Exception:
+                        pass  # DLQ failure must never block dispatch
+
+        # --- Middleware after-dispatch hook ---
+        if self._middleware is not None:
+            try:
+                await self._middleware.run_after(event, list(results))
+            except Exception:
+                pass  # Middleware failure must never block dispatch
 
     async def _safe_call_handler(self, handler: Callable[[Event], Any], event: Event) -> None:
         """Safely call a handler, catching exceptions.
@@ -786,7 +892,36 @@ class EventBus:
                 for et, m in self._per_type_metrics.items()
                 if m.count > 0
             },
+            # DLQ stats
+            "dlq_stats": self._dlq.get_stats() if self._dlq is not None else {},
         }
+
+    def add_middleware(self, middleware: Any, priority: int = 0) -> None:
+        """Add a middleware to the pipeline. Must be called before start()."""
+        if self._middleware is not None:
+            self._middleware.add(middleware, priority)
+
+    def get_dlq(self) -> Any:
+        """Return the Dead Letter Queue instance (or None if unavailable)."""
+        return self._dlq
+
+    async def retry_dlq(self) -> int:
+        """Retry all eligible DLQ entries. Returns count of successful retries."""
+        if self._dlq is None:
+            return 0
+        return await self._dlq.retry_all(self.publish)
+
+    def get_circuit_breaker_status(self) -> dict:
+        """Return snapshot of all registered circuit breakers."""
+        if self._cb_registry is not None:
+            return self._cb_registry.get_snapshot()
+        return {}
+
+    def get_middleware_metrics(self) -> dict:
+        """Return middleware pipeline metrics snapshot."""
+        if self._metrics_mw is not None:
+            return self._metrics_mw.get_snapshot()
+        return {}
 
     async def events(self, event_type: EventType) -> AsyncIterator[Event]:
         """Create an async iterator for events of a specific type."""

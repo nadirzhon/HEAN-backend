@@ -42,6 +42,9 @@ SAFE_RELOAD_KEYS: frozenset[str] = frozenset(
         "risk_sentinel_enabled",
         "intelligence_gate_enabled",
         "intelligence_gate_reject_on_contradiction",
+        # Bus infrastructure
+        "enable_bus_middleware",
+        "enable_handler_circuit_breaker",
     }
 )
 
@@ -619,6 +622,14 @@ class HEANSettings(BaseSettings):
         gt=0,
         description="Credibility constant K in Z=n/(n+K). Lower K = faster credibility gain (actuarial)",
     )
+    oracle_source: Literal["local", "redis"] = Field(
+        default="local",
+        description="Oracle source: 'local' uses in-process OracleIntegration, 'redis' consumes oracle:signals stream",
+    )
+    oracle_engine_enabled: bool = Field(
+        default=True,
+        description="Enable Oracle Engine (TCN + fingerprinting) for hybrid signal fusion",
+    )
 
     # Physics-Aware Position Sizing
     physics_aware_sizing: bool = Field(
@@ -677,6 +688,45 @@ class HEANSettings(BaseSettings):
         default=50000,
         gt=0,
         description="Maximum EventBus queue size across all priority levels (anti-memory-leak guard)",
+    )
+
+    # Bus Middleware Pipeline
+    enable_bus_middleware: bool = Field(
+        default=True,
+        description="Enable EventBus middleware pipeline (validation, logging, metrics)",
+    )
+
+    # Dead Letter Queue
+    dlq_maxsize: int = Field(
+        default=1000,
+        gt=0,
+        description="Maximum entries in the EventBus Dead Letter Queue",
+    )
+    dlq_max_retries: int = Field(
+        default=3,
+        ge=1,
+        description="Maximum retry attempts per DLQ entry before marking as permanently failed",
+    )
+
+    # Handler Circuit Breaker
+    enable_handler_circuit_breaker: bool = Field(
+        default=False,
+        description="Enable per-handler circuit breaker wrapping on EventBus (opt-in, conservative)",
+    )
+    handler_cb_failure_threshold: int = Field(
+        default=5,
+        ge=1,
+        description="Consecutive handler failures to open the circuit breaker",
+    )
+    handler_cb_timeout_ms: int = Field(
+        default=500,
+        ge=0,
+        description="Per-handler invocation timeout in milliseconds (0 to disable)",
+    )
+    handler_cb_recovery_timeout_s: float = Field(
+        default=30.0,
+        gt=0,
+        description="Seconds to wait in OPEN state before attempting a half-open probe",
     )
 
     # AI Factory (Shadow → Canary → Production pipeline)
