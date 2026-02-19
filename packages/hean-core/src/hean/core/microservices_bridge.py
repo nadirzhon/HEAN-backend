@@ -1,6 +1,7 @@
 """Redis stream bridge for external microservices.
 
 Bridges microservice streams into the in-process EventBus:
+- ``market:{symbol}``  -> ``EventType.TICK`` / ``EventType.ORDER_BOOK_UPDATE``
 - ``physics:{symbol}`` -> ``EventType.PHYSICS_UPDATE``
 - ``brain:analysis``   -> ``EventType.BRAIN_ANALYSIS``
 - ``risk:approved``    -> ``EventType.SIGNAL`` (already risk-approved)
@@ -19,7 +20,7 @@ import orjson
 import redis.asyncio as aioredis
 
 from hean.core.bus import EventBus
-from hean.core.types import Event, EventType, Signal
+from hean.core.types import Event, EventType, Signal, Tick
 from hean.logging import get_logger
 
 logger = get_logger(__name__)
@@ -184,11 +185,13 @@ def risk_payload_to_signal(raw: dict[str, Any]) -> Signal | None:
 class BridgeMetrics:
     """Running counters for bridge observability."""
 
+    collector_consumed: int = 0
     physics_consumed: int = 0
     brain_consumed: int = 0
     risk_consumed: int = 0
     oracle_consumed: int = 0
 
+    collector_published: int = 0
     physics_published: int = 0
     brain_published: int = 0
     risk_published: int = 0
@@ -198,6 +201,7 @@ class BridgeMetrics:
     backpressure_events: int = 0
     bytes_processed: int = 0
 
+    last_collector_at: float = field(default=0.0)
     last_physics_at: float = field(default=0.0)
     last_brain_at: float = field(default=0.0)
     last_risk_at: float = field(default=0.0)
@@ -218,6 +222,7 @@ class MicroservicesBridge:
         bus: EventBus,
         redis_url: str,
         symbols: list[str],
+        consume_collector: bool = False,
         consume_physics: bool = False,
         consume_brain: bool = False,
         consume_risk: bool = False,
@@ -227,12 +232,14 @@ class MicroservicesBridge:
         self._bus = bus
         self._redis_url = redis_url
         self._symbols = symbols
+        self._consume_collector = consume_collector
         self._consume_physics = consume_physics
         self._consume_brain = consume_brain
         self._consume_risk = consume_risk
         self._consume_oracle = consume_oracle
 
         self._consumer_id = f"{group_prefix}-{uuid.uuid4().hex[:8]}"
+        self._collector_group = f"{group_prefix}-collector"
         self._physics_group = f"{group_prefix}-physics"
         self._brain_group = f"{group_prefix}-brain"
         self._risk_group = f"{group_prefix}-risk"
@@ -262,6 +269,12 @@ class MicroservicesBridge:
         await self._redis.ping()
         self._running = True
 
+        if self._consume_collector:
+            for symbol in self._symbols:
+                stream = f"market:{symbol}"
+                await self._ensure_group(stream, self._collector_group)
+                self._tasks.append(asyncio.create_task(self._collector_loop(symbol)))
+
         if self._consume_physics:
             for symbol in self._symbols:
                 stream = f"physics:{symbol}"
@@ -281,7 +294,8 @@ class MicroservicesBridge:
             self._tasks.append(asyncio.create_task(self._oracle_loop()))
 
         logger.info(
-            "MicroservicesBridge started: physics=%s brain=%s risk=%s oracle=%s consumer=%s",
+            "MicroservicesBridge started: collector=%s physics=%s brain=%s risk=%s oracle=%s consumer=%s",
+            self._consume_collector,
             self._consume_physics,
             self._consume_brain,
             self._consume_risk,
@@ -315,12 +329,14 @@ class MicroservicesBridge:
         now = time.time()
         return {
             "consumed": {
+                "collector": m.collector_consumed,
                 "physics": m.physics_consumed,
                 "brain": m.brain_consumed,
                 "risk": m.risk_consumed,
                 "oracle": m.oracle_consumed,
             },
             "published": {
+                "collector": m.collector_published,
                 "physics": m.physics_published,
                 "brain": m.brain_published,
                 "risk": m.risk_published,
@@ -330,6 +346,7 @@ class MicroservicesBridge:
             "backpressure_events": m.backpressure_events,
             "bytes_processed": m.bytes_processed,
             "last_message_age_s": {
+                "collector": round(now - m.last_collector_at, 1) if m.last_collector_at else None,
                 "physics": round(now - m.last_physics_at, 1) if m.last_physics_at else None,
                 "brain": round(now - m.last_brain_at, 1) if m.last_brain_at else None,
                 "risk": round(now - m.last_risk_at, 1) if m.last_risk_at else None,
@@ -399,6 +416,78 @@ class MicroservicesBridge:
     # ------------------------------------------------------------------
     # Consumer loops
     # ------------------------------------------------------------------
+
+    async def _collector_loop(self, symbol: str) -> None:
+        """Consume market:{symbol} stream from collector service.
+
+        Converts raw Bybit WS messages into TICK events on the EventBus.
+        The collector publishes: orderbook, publicTrade, tickers data.
+        We extract ticker data to create Tick events.
+        """
+        if not self._redis:
+            return
+        stream_name = f"market:{symbol}"
+        while self._running:
+            try:
+                await self._check_backpressure()
+                messages = await self._redis.xreadgroup(
+                    self._collector_group,
+                    self._consumer_id,
+                    {stream_name: ">"},
+                    count=50,
+                    block=1000,
+                )
+                for stream, stream_messages in messages:
+                    for msg_id, msg_data in stream_messages:
+                        raw_bytes = msg_data.get(b"data") or msg_data.get("data") or b""
+                        self._metrics.bytes_processed += len(raw_bytes)
+                        self._metrics.collector_consumed += 1
+
+                        payload = self._decode_payload(msg_data)
+                        if not payload:
+                            await self._redis.xack(stream, self._collector_group, msg_id)
+                            continue
+
+                        topic = payload.get("topic", "")
+                        data = payload.get("data")
+
+                        if "tickers" in topic and isinstance(data, dict):
+                            # Ticker data -> TICK event
+                            last_price = float(data.get("lastPrice", 0))
+                            if last_price > 0:
+                                tick = Tick(
+                                    symbol=symbol,
+                                    price=last_price,
+                                    volume=float(data.get("volume24h", 0)),
+                                )
+                                await self._bus.publish(
+                                    Event(
+                                        event_type=EventType.TICK,
+                                        data={"tick": tick},
+                                    )
+                                )
+                                self._metrics.collector_published += 1
+                        elif "orderbook" in topic and isinstance(data, (dict, list)):
+                            # Orderbook data -> ORDER_BOOK_UPDATE event
+                            await self._bus.publish(
+                                Event(
+                                    event_type=EventType.ORDER_BOOK_UPDATE,
+                                    data={
+                                        "symbol": symbol,
+                                        "orderbook": data,
+                                    },
+                                )
+                            )
+                            self._metrics.collector_published += 1
+
+                        self._metrics.last_collector_at = time.time()
+                        await self._redis.xack(stream, self._collector_group, msg_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._metrics.errors += 1
+                logger.warning("Collector bridge loop error (%s): %s", symbol, exc)
+                await asyncio.sleep(1)
 
     async def _physics_loop(self, symbol: str) -> None:
         if not self._redis:

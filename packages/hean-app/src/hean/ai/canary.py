@@ -179,7 +179,7 @@ class CanaryTester:
 
         # Publish experiment result
         await self._bus.publish(Event(
-            event_type=EventType.STRATEGY_UPDATED,
+            event_type=EventType.STRATEGY_PARAMS_UPDATED,
             data={
                 "type": "EXPERIMENT_RESULT",
                 "experiment_id": f"canary_{strategy_id}",

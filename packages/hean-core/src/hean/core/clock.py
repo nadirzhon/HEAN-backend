@@ -360,3 +360,25 @@ def reset_clock() -> None:
     """
     global _default_clock
     _default_clock = WallClock()
+
+
+# ---------------------------------------------------------------------------
+# Clock — convenience wrapper (Scheduler backed by the module-level clock)
+# ---------------------------------------------------------------------------
+
+
+class Clock(Scheduler):
+    """Convenience scheduler backed by the module-level clock.
+
+    ``TradingSystem`` and other top-level orchestrators can simply do::
+
+        self._clock = Clock()
+        await self._clock.start()
+        self._clock.schedule_periodic(callback, timedelta(seconds=10))
+        await self._clock.stop()
+
+    Under the hood this is a ``Scheduler`` that delegates to ``get_clock()``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(get_clock())

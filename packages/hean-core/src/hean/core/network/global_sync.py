@@ -216,7 +216,7 @@ class DistributedNodeManager:
         self._master_check_task = asyncio.create_task(self._master_check_loop())
 
         # Subscribe to relevant events
-        self._bus.subscribe(EventType.ORDER_EXECUTED, self._handle_order_executed)
+        self._bus.subscribe(EventType.ORDER_FILLED, self._handle_order_executed)
         self._bus.subscribe(EventType.POSITION_UPDATE, self._handle_position_update)
 
         logger.info("Distributed Node Manager started")
@@ -244,7 +244,7 @@ class DistributedNodeManager:
                 pass
 
         # Unsubscribe from events
-        self._bus.unsubscribe(EventType.ORDER_EXECUTED, self._handle_order_executed)
+        self._bus.unsubscribe(EventType.ORDER_FILLED, self._handle_order_executed)
         self._bus.unsubscribe(EventType.POSITION_UPDATE, self._handle_position_update)
 
         # Close gRPC connections

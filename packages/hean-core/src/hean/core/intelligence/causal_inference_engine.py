@@ -491,6 +491,22 @@ class CausalInferenceEngine:
                         data={"signal": signal}
                     )
                 )
+                # Also publish CAUSAL_SIGNAL for ContextAggregator enrichment
+                await self._bus.publish(
+                    Event(
+                        event_type=EventType.CAUSAL_SIGNAL,
+                        data={
+                            "source_symbol": source,
+                            "target_symbol": target,
+                            "predicted_direction": predicted_direction,
+                            "predicted_magnitude": predicted_magnitude,
+                            "confidence": relationship.confidence,
+                            "granger_causality": relationship.granger_causality,
+                            "transfer_entropy": relationship.transfer_entropy,
+                            "lag_periods": relationship.lag_period,
+                        },
+                    )
+                )
 
                 logger.info(
                     f"Pre-echo signal: {source} -> {target} {predicted_direction.upper()}, "

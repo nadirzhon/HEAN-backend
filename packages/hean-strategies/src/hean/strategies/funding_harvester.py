@@ -18,7 +18,7 @@ from typing import Any
 from hean.core.bus import EventBus
 from hean.core.market_context import UnifiedMarketContext
 from hean.core.regime import Regime
-from hean.core.types import Event, FundingRate, Signal, Tick
+from hean.core.types import Event, EventType, FundingRate, Signal, Tick
 from hean.logging import get_logger
 from hean.observability.metrics import metrics
 from hean.strategies.base import BaseStrategy
@@ -681,7 +681,7 @@ class FundingHarvester(BaseStrategy):
 
                     # Emit funding event
                     await self._bus.publish(Event(
-                        event_type="FUNDING",
+                        event_type=EventType.FUNDING,
                         data={"funding": funding},
                     ))
                     logger.info(

@@ -19,10 +19,7 @@ from hean.core.arb.triangular_scanner import TriangularScanner
 from hean.core.bus import EventBus
 from hean.core.clock import Clock
 from hean.core.fabric import CausalRegistry, EEVScorer, EventDNA, extract_dna, inject_dna
-from hean.core.intelligence.causal_inference_engine import CausalInferenceEngine
 from hean.core.intelligence.correlation_engine import CorrelationEngine
-from hean.core.intelligence.meta_learning_engine import MetaLearningEngine
-from hean.core.intelligence.multimodal_swarm import MultimodalSwarm
 from hean.core.multi_symbol_scanner import MultiSymbolScanner
 from hean.core.regime import Regime, RegimeDetector
 from hean.core.telemetry.self_insight import SelfInsightCollector
@@ -172,11 +169,6 @@ class TradingSystem:
         self._correlation_engine: CorrelationEngine | None = None
         self._safety_net: GlobalSafetyNet | None = None
         self._self_healing: SelfHealingMiddleware | None = None
-
-        # Absolute+: Post-Singularity Systems (Market-Architecting Entity)
-        self._meta_learning_engine: MetaLearningEngine | None = None
-        self._causal_inference_engine: CausalInferenceEngine | None = None
-        self._multimodal_swarm: MultimodalSwarm | None = None
 
         # Skip HealthCheck in evaluate mode
         self._health_check = HealthCheck() if mode == "run" else None
@@ -540,16 +532,6 @@ class TradingSystem:
                     logger.info(f"Phase 5: Kelly Criterion enabled with fractional_kelly={settings.phase5_kelly_fractional}")
             except Exception as e:
                 logger.warning(f"Could not enable Kelly Criterion: {e}")
-
-        # Absolute+: Initialize Post-Singularity Systems
-        if self._mode == "run" and getattr(settings, 'absolute_plus_enabled', True):
-            self._meta_learning_engine = None
-            self._causal_inference_engine = None
-            self._multimodal_swarm = None
-            logger.info(
-                "Absolute+ engines are disabled at runtime "
-                "(no execution-path consumers configured)."
-            )
 
         # Physics Engine: Market thermodynamics
         if self._mode == "run" and not use_redis_physics:
@@ -1046,28 +1028,28 @@ class TradingSystem:
 
         # Phase 5: Register dormant strategies (AFO-Director dormant strategies)
         # HF Scalping - high frequency scalping for range/normal regimes
-        if getattr(settings, 'hf_scalping_enabled', False):
+        if settings.hf_scalping_enabled:
             strategy = HFScalpingStrategy(self._bus, symbols)
             await strategy.start()
             self._strategies.append(strategy)
             logger.info("HF Scalping Strategy registered and started")
 
         # Enhanced Grid - grid trading for range-bound markets
-        if getattr(settings, 'enhanced_grid_enabled', False):
+        if settings.enhanced_grid_enabled:
             strategy = EnhancedGridStrategy(self._bus, symbols)
             await strategy.start()
             self._strategies.append(strategy)
             logger.info("Enhanced Grid Strategy registered and started")
 
         # Momentum Trader - momentum following strategy
-        if getattr(settings, 'momentum_trader_enabled', False):
+        if settings.momentum_trader_enabled:
             strategy = MomentumTrader(self._bus, symbols)
             await strategy.start()
             self._strategies.append(strategy)
             logger.info("Momentum Trader Strategy registered and started")
 
         # Inventory Neutral Market Making
-        if getattr(settings, 'inventory_neutral_mm_enabled', False):
+        if settings.inventory_neutral_mm_enabled:
             strategy = InventoryNeutralMM(
                 self._bus,
                 ofi_monitor=getattr(self, '_ofi_monitor', None),
@@ -1078,21 +1060,21 @@ class TradingSystem:
             logger.info("Inventory Neutral MM Strategy registered and started")
 
         # Correlation Arbitrage
-        if getattr(settings, 'correlation_arb_enabled', False):
+        if settings.correlation_arb_enabled:
             strategy = CorrelationArbitrage(self._bus)
             await strategy.start()
             self._strategies.append(strategy)
             logger.info("Correlation Arbitrage Strategy registered and started")
 
         # Rebate Farmer
-        if getattr(settings, 'rebate_farmer_enabled', False):
+        if settings.rebate_farmer_enabled:
             strategy = RebateFarmer(self._bus, symbols=symbols)
             await strategy.start()
             self._strategies.append(strategy)
             logger.info("Rebate Farmer Strategy registered and started")
 
         # Liquidity Sweep Detector
-        if getattr(settings, 'liquidity_sweep_enabled', False):
+        if settings.liquidity_sweep_enabled:
             strategy = LiquiditySweepDetector(
                 self._bus,
                 symbols=symbols,
@@ -1103,7 +1085,7 @@ class TradingSystem:
             logger.info("Liquidity Sweep Detector registered and started")
 
         # Sentiment Strategy
-        if getattr(settings, 'sentiment_strategy_enabled', False):
+        if settings.sentiment_strategy_enabled:
             strategy = SentimentStrategy(self._bus, symbols=symbols)
             await strategy.start()
             self._strategies.append(strategy)
@@ -2629,6 +2611,23 @@ class TradingSystem:
         self._accounting.record_fill(order, fill_price, fee)
         logger.info(f"[ORDER_FILLED_HANDLER] Accounting updated for order {order.order_id}")
 
+        # Re-publish ORDER_FILLED on EventBus for downstream listeners
+        # (feedback_agent, API stream, execution routers, global_sync)
+        await self._bus.publish(
+            Event(
+                event_type=EventType.ORDER_FILLED,
+                data={
+                    "order": order,
+                    "fill_price": fill_price,
+                    "fill_size": event.data.get("fill_size", order.qty),
+                    "fee": fee,
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "strategy_id": order.strategy_id,
+                },
+            )
+        )
+
         # Detect close fills: check if this fill reduces an existing position
         # A close fill occurs when we have a position and the fill is on the opposite side
         is_close_fill = False
@@ -3214,6 +3213,20 @@ class TradingSystem:
             Event(
                 event_type=EventType.PNL_UPDATE,
                 data=snapshot,
+            )
+        )
+        # Also publish EQUITY_UPDATE for risk/strategy listeners
+        # (RLRiskManager, StrategyManager subscribe to this)
+        account = snapshot.get("account_state", {})
+        await self._bus.publish(
+            Event(
+                event_type=EventType.EQUITY_UPDATE,
+                data={
+                    "equity": account.get("equity", 0.0),
+                    "available_balance": account.get("available_balance", 0.0),
+                    "unrealized_pnl": account.get("unrealized_pnl", 0.0),
+                    "daily_pnl": account.get("daily_pnl", 0.0),
+                },
             )
         )
 

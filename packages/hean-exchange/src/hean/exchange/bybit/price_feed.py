@@ -130,6 +130,18 @@ class BybitPriceFeed(PriceFeed):
                             await self._bus.publish(
                                 Event(event_type=EventType.FUNDING, data={"funding": funding})
                             )
+                            # Also publish FUNDING_UPDATE for components tracking rate changes
+                            # (market_genome, sovereign_brain subscribe to this)
+                            await self._bus.publish(
+                                Event(
+                                    event_type=EventType.FUNDING_UPDATE,
+                                    data={
+                                        "symbol": symbol,
+                                        "rate": rate,
+                                        "funding": funding,
+                                    },
+                                )
+                            )
 
                             logger.debug(f"Published funding rate for {symbol}: {rate:.6f}")
                     except Exception as e:
