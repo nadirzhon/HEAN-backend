@@ -2,14 +2,17 @@
 
 Bridges microservice streams into the in-process EventBus:
 - ``physics:{symbol}`` -> ``EventType.PHYSICS_UPDATE``
-- ``brain:analysis`` -> ``EventType.BRAIN_ANALYSIS``
-- ``risk:approved`` -> ``EventType.SIGNAL`` (already risk-approved)
+- ``brain:analysis``   -> ``EventType.BRAIN_ANALYSIS``
+- ``risk:approved``    -> ``EventType.SIGNAL`` (already risk-approved)
+- ``oracle:signals``   -> ``EventType.ORACLE_PREDICTION``
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import orjson
@@ -20,6 +23,11 @@ from hean.core.types import Event, EventType, Signal
 from hean.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -43,6 +51,17 @@ def _entropy_state(entropy: float) -> str:
     if entropy < 2.0:
         return "COMPRESSED"
     return "NORMAL"
+
+
+def _oracle_signal_to_direction(signal: str) -> str:
+    """Map oracle signal string (BUY/SELL/HOLD) to normalised direction."""
+    mapping = {"BUY": "long", "SELL": "short", "HOLD": "neutral"}
+    return mapping.get(str(signal).upper(), "neutral")
+
+
+# ---------------------------------------------------------------------------
+# Normalizers
+# ---------------------------------------------------------------------------
 
 
 def normalize_physics_update(raw: dict[str, Any]) -> dict[str, Any]:
@@ -85,6 +104,24 @@ def normalize_brain_analysis(raw: dict[str, Any]) -> dict[str, Any]:
         "summary": raw.get("summary", ""),
         "market_regime": str(raw.get("market_regime", raw.get("phase", "unknown"))).lower(),
         "risk_level": raw.get("risk_level"),
+        "timestamp": raw.get("timestamp"),
+    }
+
+
+def normalize_oracle_signal(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize oracle payload from microservice to core schema.
+
+    Expected source fields (from ``services/oracle/main.py``):
+        symbol, signal (BUY/SELL/HOLD), confidence, price,
+        fusion_sources, timestamp
+    """
+    return {
+        "symbol": raw.get("symbol"),
+        "direction": _oracle_signal_to_direction(raw.get("signal", "HOLD")),
+        "confidence": max(0.0, min(1.0, _safe_float(raw.get("confidence"), 0.0))),
+        "price": _safe_float(raw.get("price"), 0.0),
+        "fusion_sources": raw.get("fusion_sources", []),
+        "source": "oracle-microservice",
         "timestamp": raw.get("timestamp"),
     }
 
@@ -138,6 +175,40 @@ def risk_payload_to_signal(raw: dict[str, Any]) -> Signal | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BridgeMetrics:
+    """Running counters for bridge observability."""
+
+    physics_consumed: int = 0
+    brain_consumed: int = 0
+    risk_consumed: int = 0
+    oracle_consumed: int = 0
+
+    physics_published: int = 0
+    brain_published: int = 0
+    risk_published: int = 0
+    oracle_published: int = 0
+
+    errors: int = 0
+    backpressure_events: int = 0
+    bytes_processed: int = 0
+
+    last_physics_at: float = field(default=0.0)
+    last_brain_at: float = field(default=0.0)
+    last_risk_at: float = field(default=0.0)
+    last_oracle_at: float = field(default=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Bridge
+# ---------------------------------------------------------------------------
+
+
 class MicroservicesBridge:
     """Read external Redis streams and publish normalized EventBus events."""
 
@@ -150,6 +221,7 @@ class MicroservicesBridge:
         consume_physics: bool = False,
         consume_brain: bool = False,
         consume_risk: bool = False,
+        consume_oracle: bool = False,
         group_prefix: str = "hean-core",
     ) -> None:
         self._bus = bus
@@ -158,15 +230,23 @@ class MicroservicesBridge:
         self._consume_physics = consume_physics
         self._consume_brain = consume_brain
         self._consume_risk = consume_risk
+        self._consume_oracle = consume_oracle
 
         self._consumer_id = f"{group_prefix}-{uuid.uuid4().hex[:8]}"
         self._physics_group = f"{group_prefix}-physics"
         self._brain_group = f"{group_prefix}-brain"
         self._risk_group = f"{group_prefix}-risk"
+        self._oracle_group = f"{group_prefix}-oracle"
 
         self._redis: aioredis.Redis | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._running = False
+
+        self._metrics = BridgeMetrics()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
         if self._running:
@@ -196,11 +276,16 @@ class MicroservicesBridge:
             await self._ensure_group("risk:approved", self._risk_group)
             self._tasks.append(asyncio.create_task(self._risk_loop()))
 
+        if self._consume_oracle:
+            await self._ensure_group("oracle:signals", self._oracle_group)
+            self._tasks.append(asyncio.create_task(self._oracle_loop()))
+
         logger.info(
-            "MicroservicesBridge started: physics=%s brain=%s risk=%s consumer=%s",
+            "MicroservicesBridge started: physics=%s brain=%s risk=%s oracle=%s consumer=%s",
             self._consume_physics,
             self._consume_brain,
             self._consume_risk,
+            self._consume_oracle,
             self._consumer_id,
         )
 
@@ -219,6 +304,76 @@ class MicroservicesBridge:
             await self._redis.close()
             self._redis = None
         logger.info("MicroservicesBridge stopped")
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Return a snapshot of bridge metrics for external observability."""
+        m = self._metrics
+        now = time.time()
+        return {
+            "consumed": {
+                "physics": m.physics_consumed,
+                "brain": m.brain_consumed,
+                "risk": m.risk_consumed,
+                "oracle": m.oracle_consumed,
+            },
+            "published": {
+                "physics": m.physics_published,
+                "brain": m.brain_published,
+                "risk": m.risk_published,
+                "oracle": m.oracle_published,
+            },
+            "errors": m.errors,
+            "backpressure_events": m.backpressure_events,
+            "bytes_processed": m.bytes_processed,
+            "last_message_age_s": {
+                "physics": round(now - m.last_physics_at, 1) if m.last_physics_at else None,
+                "brain": round(now - m.last_brain_at, 1) if m.last_brain_at else None,
+                "risk": round(now - m.last_risk_at, 1) if m.last_risk_at else None,
+                "oracle": round(now - m.last_oracle_at, 1) if m.last_oracle_at else None,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Backpressure
+    # ------------------------------------------------------------------
+
+    async def _check_backpressure(self) -> None:
+        """Adaptive backpressure: slow down consumption when bus is overloaded.
+
+        Uses ``EventBus.get_health()`` to read current queue utilisation. This
+        method is intentionally non-blocking for the common (healthy) path — it
+        only sleeps when the bus is genuinely saturated.
+        """
+        if not hasattr(self._bus, "get_health"):
+            return
+
+        health = self._bus.get_health()
+        utilization = health.queue_utilization_pct
+
+        if utilization > 95:
+            # Critical: pause consumption to let the bus drain.
+            self._metrics.backpressure_events += 1
+            logger.warning(
+                "Bridge backpressure: bus at %.1f%%, pausing 1s",
+                utilization,
+            )
+            await asyncio.sleep(1.0)
+        elif utilization > 80:
+            # Degraded: gently slow down.
+            self._metrics.backpressure_events += 1
+            logger.debug(
+                "Bridge backpressure: bus at %.1f%%, slowing 200ms",
+                utilization,
+            )
+            await asyncio.sleep(0.2)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     async def _ensure_group(self, stream: str, group: str) -> None:
         if not self._redis:
@@ -241,12 +396,17 @@ class MicroservicesBridge:
         except Exception:
             return None
 
+    # ------------------------------------------------------------------
+    # Consumer loops
+    # ------------------------------------------------------------------
+
     async def _physics_loop(self, symbol: str) -> None:
         if not self._redis:
             return
         stream_name = f"physics:{symbol}"
         while self._running:
             try:
+                await self._check_backpressure()
                 messages = await self._redis.xreadgroup(
                     self._physics_group,
                     self._consumer_id,
@@ -256,6 +416,10 @@ class MicroservicesBridge:
                 )
                 for stream, stream_messages in messages:
                     for msg_id, msg_data in stream_messages:
+                        raw_bytes = msg_data.get(b"data") or msg_data.get("data") or b""
+                        self._metrics.bytes_processed += len(raw_bytes)
+                        self._metrics.physics_consumed += 1
+
                         payload = self._decode_payload(msg_data)
                         if payload:
                             physics = normalize_physics_update(payload)
@@ -266,11 +430,16 @@ class MicroservicesBridge:
                                     data={"symbol": sym, "physics": physics},
                                 )
                             )
+                            self._metrics.physics_published += 1
+                            self._metrics.last_physics_at = time.time()
+
+                        # ACK after successful publish so Redis redelivers on publish failure
                         await self._redis.xack(stream, self._physics_group, msg_id)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.debug("Physics bridge loop error (%s): %s", symbol, exc)
+                self._metrics.errors += 1
+                logger.warning("Physics bridge loop error (%s): %s", symbol, exc)
                 await asyncio.sleep(1)
 
     async def _brain_loop(self) -> None:
@@ -279,6 +448,7 @@ class MicroservicesBridge:
         stream_name = "brain:analysis"
         while self._running:
             try:
+                await self._check_backpressure()
                 messages = await self._redis.xreadgroup(
                     self._brain_group,
                     self._consumer_id,
@@ -288,17 +458,26 @@ class MicroservicesBridge:
                 )
                 for stream, stream_messages in messages:
                     for msg_id, msg_data in stream_messages:
+                        raw_bytes = msg_data.get(b"data") or msg_data.get("data") or b""
+                        self._metrics.bytes_processed += len(raw_bytes)
+                        self._metrics.brain_consumed += 1
+
                         payload = self._decode_payload(msg_data)
                         if payload:
                             analysis = normalize_brain_analysis(payload)
                             await self._bus.publish(
                                 Event(event_type=EventType.BRAIN_ANALYSIS, data=analysis)
                             )
+                            self._metrics.brain_published += 1
+                            self._metrics.last_brain_at = time.time()
+
+                        # ACK after successful publish so Redis redelivers on publish failure
                         await self._redis.xack(stream, self._brain_group, msg_id)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.debug("Brain bridge loop error: %s", exc)
+                self._metrics.errors += 1
+                logger.warning("Brain bridge loop error: %s", exc)
                 await asyncio.sleep(1)
 
     async def _risk_loop(self) -> None:
@@ -307,6 +486,7 @@ class MicroservicesBridge:
         stream_name = "risk:approved"
         while self._running:
             try:
+                await self._check_backpressure()
                 messages = await self._redis.xreadgroup(
                     self._risk_group,
                     self._consumer_id,
@@ -316,6 +496,10 @@ class MicroservicesBridge:
                 )
                 for stream, stream_messages in messages:
                     for msg_id, msg_data in stream_messages:
+                        raw_bytes = msg_data.get(b"data") or msg_data.get("data") or b""
+                        self._metrics.bytes_processed += len(raw_bytes)
+                        self._metrics.risk_consumed += 1
+
                         payload = self._decode_payload(msg_data)
                         if payload:
                             signal = risk_payload_to_signal(payload)
@@ -326,9 +510,56 @@ class MicroservicesBridge:
                                         data={"signal": signal},
                                     )
                                 )
+                                self._metrics.risk_published += 1
+                                self._metrics.last_risk_at = time.time()
+
+                        # ACK after successful publish so Redis redelivers on publish failure
                         await self._redis.xack(stream, self._risk_group, msg_id)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.debug("Risk bridge loop error: %s", exc)
+                self._metrics.errors += 1
+                logger.error("Risk bridge loop error: %s", exc)
+                await asyncio.sleep(1)
+
+    async def _oracle_loop(self) -> None:
+        """Consume ``oracle:signals`` stream and publish ``ORACLE_PREDICTION`` events."""
+        if not self._redis:
+            return
+        stream_name = "oracle:signals"
+        while self._running:
+            try:
+                await self._check_backpressure()
+                messages = await self._redis.xreadgroup(
+                    self._oracle_group,
+                    self._consumer_id,
+                    {stream_name: ">"},
+                    count=20,
+                    block=1000,
+                )
+                for stream, stream_messages in messages:
+                    for msg_id, msg_data in stream_messages:
+                        raw_bytes = msg_data.get(b"data") or msg_data.get("data") or b""
+                        self._metrics.bytes_processed += len(raw_bytes)
+                        self._metrics.oracle_consumed += 1
+
+                        payload = self._decode_payload(msg_data)
+                        if payload:
+                            prediction = normalize_oracle_signal(payload)
+                            await self._bus.publish(
+                                Event(
+                                    event_type=EventType.ORACLE_PREDICTION,
+                                    data=prediction,
+                                )
+                            )
+                            self._metrics.oracle_published += 1
+                            self._metrics.last_oracle_at = time.time()
+
+                        # ACK after successful publish so Redis redelivers on publish failure
+                        await self._redis.xack(stream, self._oracle_group, msg_id)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._metrics.errors += 1
+                logger.error("Oracle bridge loop error: %s", exc)
                 await asyncio.sleep(1)

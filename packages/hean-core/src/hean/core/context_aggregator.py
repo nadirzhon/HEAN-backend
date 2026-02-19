@@ -11,7 +11,7 @@ ContextAggregator — центральный хаб интеграции HEAN.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from hean.core.bus import EventBus
@@ -130,13 +130,13 @@ class ContextAggregator:
             ctx.bid = tick.bid
         if tick.ask:
             ctx.ask = tick.ask
-        ctx.last_tick_at = datetime.utcnow()
+        ctx.last_tick_at = datetime.now(UTC)
 
         # Рассчитать spread
         if ctx.bid > 0 and ctx.ask > 0 and ctx.price > 0:
             ctx.order_flow.spread_bps = (ctx.ask - ctx.bid) / ctx.price * 10000
 
-        ctx.components_updated["tick"] = datetime.utcnow()
+        ctx.components_updated["tick"] = datetime.now(UTC)
         self._tick_count += 1
 
         # Публиковать CONTEXT_READY с тротлингом (каждые 200мс)
@@ -152,7 +152,7 @@ class ContextAggregator:
 
         ctx.regime = regime
         ctx.regime_confidence = event.data.get("confidence", 0.0)
-        ctx.components_updated["regime"] = datetime.utcnow()
+        ctx.components_updated["regime"] = datetime.now(UTC)
 
     async def _on_context_update(self, event: Event) -> None:
         """Обработать CONTEXT_UPDATE — backward compat + physics + oracle_weights."""
@@ -179,7 +179,7 @@ class ContextAggregator:
                 trade_reason=physics_data.get("trade_reason", ""),
                 size_multiplier=physics_data.get("size_multiplier", 1.0),
             )
-            ctx.components_updated["physics"] = datetime.utcnow()
+            ctx.components_updated["physics"] = datetime.now(UTC)
 
         elif context_type == "oracle_weights":
             # DynamicOracleWeightManager публикует динамические веса сигналов
@@ -189,7 +189,7 @@ class ContextAggregator:
             if not ctx or not weights:
                 return
             ctx.oracle_weights = weights
-            ctx.components_updated["oracle_weights"] = datetime.utcnow()
+            ctx.components_updated["oracle_weights"] = datetime.now(UTC)
 
     async def _on_physics(self, event: Event) -> None:
         """Обработать PHYSICS_UPDATE (отдельный event type)."""
@@ -211,7 +211,7 @@ class ContextAggregator:
             trade_reason=data.get("trade_reason", ""),
             size_multiplier=data.get("size_multiplier", 1.0),
         )
-        ctx.components_updated["physics"] = datetime.utcnow()
+        ctx.components_updated["physics"] = datetime.now(UTC)
 
 
     async def _on_brain(self, event: Event) -> None:
@@ -236,9 +236,9 @@ class ContextAggregator:
             key_forces=data.get("key_forces", data.get("forces", [])),
             recommended_action=data.get("recommended_action", "hold"),
             reasoning=data.get("reasoning", data.get("summary", "")),
-            updated_at=datetime.utcnow(),
+            updated_at=datetime.now(UTC),
         )
-        ctx.components_updated["brain"] = datetime.utcnow()
+        ctx.components_updated["brain"] = datetime.now(UTC)
 
     async def _on_prediction(self, event: Event) -> None:
         """Обновить предсказания Oracle/TCN."""
@@ -256,7 +256,7 @@ class ContextAggregator:
             fingerprint_confidence=data.get("fingerprint_confidence", 0.0),
             price_prediction_5s=data.get("price_5s"),
         )
-        ctx.components_updated["prediction"] = datetime.utcnow()
+        ctx.components_updated["prediction"] = datetime.now(UTC)
 
     async def _on_ofi(self, event: Event) -> None:
         """Обновить Order Flow данные."""
@@ -271,7 +271,7 @@ class ContextAggregator:
         ctx.order_flow.aggression_buy = data.get("aggression_buy", 0.0)
         ctx.order_flow.aggression_sell = data.get("aggression_sell", 0.0)
         ctx.order_flow.book_imbalance = data.get("book_imbalance", 0.0)
-        ctx.components_updated["ofi"] = datetime.utcnow()
+        ctx.components_updated["ofi"] = datetime.now(UTC)
 
     async def _on_causal(self, event: Event) -> None:
         """Обновить каузальные сигналы."""
@@ -288,14 +288,14 @@ class ContextAggregator:
             source_symbol=data.get("source_symbol", ""),
             lag_ms=data.get("lag_ms", 0),
         )
-        ctx.components_updated["causal"] = datetime.utcnow()
+        ctx.components_updated["causal"] = datetime.now(UTC)
 
 
     # ─── Публикация ────────────────────────────────────────────
 
     async def _maybe_publish(self, symbol: str) -> None:
         """Опубликовать CONTEXT_READY с тротлингом."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         last = self._last_publish.get(symbol)
 
         if last and (now - last).total_seconds() * 1000 < self._publish_throttle_ms:
@@ -314,7 +314,7 @@ class ContextAggregator:
 
     def get_diagnostics(self) -> dict[str, Any]:
         """Диагностика: какие компоненты обновляются, какие молчат."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         result: dict[str, Any] = {
             "tick_count": self._tick_count,
             "symbols": {},
