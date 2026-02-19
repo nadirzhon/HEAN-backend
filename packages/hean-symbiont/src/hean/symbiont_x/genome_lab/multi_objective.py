@@ -1,7 +1,7 @@
 """
 Multi-Objective GA — NSGA-II + Island Model для Symbiont X
 
-Pareto-ранжирование по трём целям: [sharpe_ratio, -max_drawdown, win_rate].
+Pareto-ранжирование по трём целям: [calmar_ratio, omega_ratio, sortino_ratio].
 Island Model: N суб-популяций, специализированных по рыночным режимам,
 с периодической миграцией лучших геномов между островами.
 
@@ -9,6 +9,11 @@ Island Model: N суб-популяций, специализированных 
 - Единая fitness-метрика создаёт компромисс (высокий Sharpe часто = высокий DD)
 - Pareto-фронт сохраняет ALL непревосходимые компромиссы
 - Island Model предотвращает преждевременную конвергенцию к локальному минимуму
+
+Метрики (все ориентированы на максимизацию):
+- Calmar Ratio (Young, 1991): return / max_drawdown — критично для крипто
+- Omega Ratio (Keating & Shadwick, 2002): полное распределение, не только μ и σ
+- Sortino Ratio (Sortino & Price, 1994): не штрафует upside volatility
 """
 
 from __future__ import annotations
@@ -32,16 +37,32 @@ ISLAND_REGIMES = ["trending", "ranging", "volatile", "funding", "mixed"]
 
 def _objectives(genome: StrategyGenome) -> tuple[float, float, float]:
     """
-    Извлекает вектор целей из генома.
-    Все цели ориентированы на МАКСИМИЗАЦИЮ:
-      - sharpe_ratio: выше лучше
-      - -max_drawdown: ниже просадка → выше значение
-      - win_rate: выше лучше
+    Извлекает вектор целей из генома для NSGA-II.
+    Все цели ориентированы на МАКСИМИЗАЦИЮ.
+
+    БЫЛО: (sharpe_ratio, -max_drawdown, win_rate)
+    СТАЛО: (calmar_ratio, omega_ratio, sortino_ratio)
+
+    Источники:
+    - Calmar: Young (1991) — измеряет return / max_drawdown напрямую,
+      что критично для крипто-торговли с её экстремальными просадками
+    - Omega: Keating & Shadwick (2002) — единственная метрика, захватывающая
+      ПОЛНОЕ распределение доходностей (все моменты, не только μ и σ)
+    - Sortino: Sortino & Price (1994) — не штрафует за положительную волатильность
+      (upside), в отличие от Sharpe, что справедливо для асимметричных стратегий
+
+    Почему лучше исходного набора:
+    - Sharpe + (-max_drawdown) коррелируют (r ≈ 0.7–0.9 в крипто), создавая
+      вырожденный Pareto-фронт с узким разнообразием
+    - Calmar/Omega/Sortino покрывают разные аспекты риска и слабо коррелируют,
+      порождая богатый Pareto-фронт с реально различными компромиссами
+    - win_rate как цель приводит к отбору стратегий с мелкими частыми прибылями
+      и редкими катастрофическими убытками (gambler's ruin для крипто)
     """
     return (
-        genome.sharpe_ratio,
-        -genome.max_drawdown,   # инвертируем: чем меньше просадка, тем лучше
-        genome.win_rate,
+        genome.calmar_ratio,    # Calmar Ratio: Young (1991)
+        genome.omega_ratio,     # Omega Ratio: Keating & Shadwick (2002)
+        genome.sortino_ratio,   # Sortino Ratio: Sortino & Price (1994)
     )
 
 
@@ -230,7 +251,13 @@ class ParetoRanker:
         return [g for g, r in zip(population, ranks) if r == 1]
 
     def get_statistics(self, population: list[StrategyGenome]) -> dict[str, Any]:
-        """Статистика по Pareto-фронтам для мониторинга."""
+        """
+        Статистика по Pareto-фронтам для мониторинга.
+
+        Отображает диапазоны трёх целевых метрик NSGA-II:
+        calmar_ratio, omega_ratio, sortino_ratio — вместо устаревших
+        sharpe/drawdown/win_rate.
+        """
         if not population:
             return {}
 
@@ -240,18 +267,21 @@ class ParetoRanker:
             front_counts[r] += 1
 
         pareto_front = [g for g, r in zip(population, ranks) if r == 1]
-        sharpe_vals = [g.sharpe_ratio for g in pareto_front]
-        dd_vals = [g.max_drawdown for g in pareto_front]
-        wr_vals = [g.win_rate for g in pareto_front]
+        calmar_vals = [g.calmar_ratio for g in pareto_front]
+        omega_vals = [g.omega_ratio for g in pareto_front]
+        sortino_vals = [g.sortino_ratio for g in pareto_front]
 
         return {
             'n_fronts': max(ranks) if ranks else 0,
             'pareto_front_size': len(pareto_front),
             'front_distribution': dict(front_counts),
             'pareto_front_metrics': {
-                'sharpe_range': (min(sharpe_vals, default=0), max(sharpe_vals, default=0)),
-                'drawdown_range': (min(dd_vals, default=0), max(dd_vals, default=0)),
-                'win_rate_range': (min(wr_vals, default=0), max(wr_vals, default=0)),
+                # Calmar: Young (1991) — return / max_drawdown
+                'calmar_range': (min(calmar_vals, default=0.0), max(calmar_vals, default=0.0)),
+                # Omega: Keating & Shadwick (2002) — полное распределение доходностей
+                'omega_range': (min(omega_vals, default=0.0), max(omega_vals, default=0.0)),
+                # Sortino: Sortino & Price (1994) — только downside volatility
+                'sortino_range': (min(sortino_vals, default=0.0), max(sortino_vals, default=0.0)),
             },
         }
 
@@ -378,6 +408,66 @@ class IslandModel:
             if island.population:
                 island.best_fitness = max(g.fitness_score for g in island.population)
                 island.generation += 1
+
+    def get_island_for_phase(self, physics_phase: str) -> Island | None:
+        """
+        Возвращает остров, специализированный на данном physics_phase.
+
+        Маппинг:
+            markup       → trending
+            accumulation → ranging
+            distribution → volatile
+            markdown     → volatile
+            vapor        → volatile
+            ice          → ranging
+            unknown      → mixed
+        """
+        _PHASE_TO_REGIME: dict[str, str] = {
+            "markup": "trending",
+            "accumulation": "ranging",
+            "distribution": "volatile",
+            "markdown": "volatile",
+            "vapor": "volatile",
+            "ice": "ranging",
+        }
+        target_regime = _PHASE_TO_REGIME.get(physics_phase, "mixed")
+        for island in self.islands:
+            if island.regime == target_regime:
+                return island
+        return None
+
+    def evolve_island_for_phase(
+        self,
+        physics_phase: str,
+        fitness_key: str | None = None,
+    ) -> list[StrategyGenome]:
+        """
+        Возвращает геномы с острова, специализированного на physics_phase,
+        отсортированные по regime-specific fitness (или глобальному fitness_score
+        если fitness_key не задан).
+
+        Полезно для phase-aware selection: вместо глобального ранжирования
+        берём лучших именно для текущей рыночной фазы.
+
+        Args:
+            physics_phase: Текущая physics phase (markup/accumulation/...).
+            fitness_key:   Если не None — сортируем по get_regime_fitness(physics_phase),
+                           иначе по fitness_score.
+
+        Returns:
+            Список геномов острова, отсортированный по убыванию fitness.
+            Если подходящего острова нет — вся популяция.
+        """
+        island = self.get_island_for_phase(physics_phase)
+        if island is None:
+            return self.gather_population()
+
+        sorted_genomes = sorted(
+            island.population,
+            key=lambda g: g.get_regime_fitness(physics_phase) if fitness_key else g.fitness_score,
+            reverse=True,
+        )
+        return sorted_genomes
 
     def get_best_genome(self) -> StrategyGenome | None:
         """Возвращает лучший геном среди всех островов."""

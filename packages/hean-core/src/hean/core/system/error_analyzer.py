@@ -487,13 +487,22 @@ def setup_exception_hook(auto_dev_mode: bool = False) -> None:
             except Exception as e:
                 logger.error(f"Error analyzer failed: {e}", exc_info=True)
 
-        # Run analysis in background
+        # Run analysis in background.
+        # sys.excepthook fires in a sync context — the event loop may or may
+        # not be running.  We use get_running_loop() (non-deprecated) to detect
+        # the running case, and fall back to a brand-new loop for the rare case
+        # where this hook fires before the async runtime is started.
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(analyze())
-            else:
-                loop.run_until_complete(analyze())
+            running_loop = asyncio.get_running_loop()
+            # A loop is running (typical case: exception inside async code)
+            running_loop.create_task(analyze())
+        except RuntimeError:
+            # No running loop — exception happened before asyncio.run().
+            # Spin up a temporary loop just for this analysis.
+            try:
+                asyncio.run(analyze())
+            except Exception:
+                pass  # Ignore errors in exception hook
         except Exception:
             pass  # Ignore errors in exception hook
 

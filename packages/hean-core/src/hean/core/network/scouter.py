@@ -187,7 +187,7 @@ class DynamicAPIScouter:
         """
         try:
             # Resolve hostname
-            addr_infos = await asyncio.get_event_loop().getaddrinfo(
+            addr_infos = await asyncio.get_running_loop().getaddrinfo(
                 host, port, family=socket.AF_INET, type=socket.SOCK_STREAM
             )
 
@@ -206,7 +206,7 @@ class DynamicAPIScouter:
 
             try:
                 await asyncio.wait_for(
-                    asyncio.get_event_loop().sock_connect(sock, sockaddr),
+                    asyncio.get_running_loop().sock_connect(sock, sockaddr),
                     timeout=2.0
                 )
 

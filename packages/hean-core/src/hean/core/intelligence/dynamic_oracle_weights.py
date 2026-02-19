@@ -107,6 +107,18 @@ class DynamicOracleWeightManager:
             "ollama": 0.15,
             "brain": 0.20,
         },
+        "water_bull": {  # Bullish trend (Kalman momentum > 0.1%) — follow the trend
+            "tcn": 0.45,      # Slightly elevated: price action carries directional signal
+            "finbert": 0.20,
+            "ollama": 0.15,
+            "brain": 0.20,
+        },
+        "water_bear": {  # Bearish trend (Kalman momentum < -0.1%) — mirror of water_bull
+            "tcn": 0.45,
+            "finbert": 0.20,
+            "ollama": 0.15,
+            "brain": 0.20,
+        },
         "unknown": {  # No clear regime
             "tcn": 0.40,
             "finbert": 0.20,
@@ -209,8 +221,12 @@ class DynamicOracleWeightManager:
         """
         phase = physics.get("phase", "unknown")
         ssd_mode = physics.get("ssd_mode", "normal")
-        entropy = physics.get("entropy", 0.5)
-        temperature = physics.get("temperature", 500.0)
+        # Prefer normalized values (per-symbol rolling z-score, [0, 1]) when available.
+        # Fall back to raw values for backward compatibility with older PHYSICS_UPDATE events
+        # that predate the normalizer.  Raw entropy and temperature are NOT suitable for the
+        # fixed thresholds below, so the fallback is 0.5 (neutral).
+        entropy = physics.get("entropy_normalized", physics.get("entropy", 0.5))
+        temperature = physics.get("temperature_normalized", 0.5)
 
         # BLOCK in Silent mode (entropy diverging)
         if ssd_mode == "silent":
@@ -240,15 +256,15 @@ class DynamicOracleWeightManager:
         ollama = regime_weights["ollama"] * ssd_adjustments["ollama"]
         brain = regime_weights["brain"] * ssd_adjustments["brain"]
 
-        # Additional entropy/temperature adjustments
-        # High entropy + high temp → boost TCN even more (chaos, trust price action)
-        if entropy > 0.7 and temperature > 800:
+        # Additional entropy/temperature adjustments (both values are [0, 1] normalized).
+        # High entropy + high temp → boost TCN (chaos, trust price action over sentiment)
+        if entropy > 0.7 and temperature > 0.7:
             tcn *= 1.15
             finbert *= 0.9
             ollama *= 0.9
 
         # Low entropy + low temp → boost sentiment (stable, wait for catalyst)
-        if entropy < 0.3 and temperature < 400:
+        if entropy < 0.3 and temperature < 0.3:
             tcn *= 0.85
             finbert *= 1.15
             ollama *= 1.15

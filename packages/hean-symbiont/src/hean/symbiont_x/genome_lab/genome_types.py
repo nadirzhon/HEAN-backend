@@ -4,6 +4,8 @@ Strategy Genome - Геном торговой стратегии
 Представление стратегии как набора генов
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import uuid
@@ -146,6 +148,16 @@ class StrategyGenome:
     sharpe_ratio: float = 0.0
     max_drawdown: float = 0.0
 
+    # Extended performance metrics (Bailey 2014, Young 1991, Keating 2002, Sortino 1994)
+    calmar_ratio: float = 0.0
+    omega_ratio: float = 0.0
+    sortino_ratio: float = 0.0
+    trial_count: int = 0          # сколько раз этот геном/предки тестировались
+    wfa_efficiency: float = 0.0   # Walk-Forward Efficiency Ratio (заполняется позже)
+
+    # Per-regime fitness scores (populated by regime-conditional evaluation)
+    fitness_by_regime: dict[str, float] = field(default_factory=dict)
+
     # Metadata
     created_at_ns: int = 0
     last_updated_ns: int = 0
@@ -172,6 +184,28 @@ class StrategyGenome:
 
         # If not found, add
         self.genes.append(gene)
+
+    def get_regime_fitness(self, physics_phase: str) -> float:
+        """
+        Возвращает fitness для конкретного physics_phase.
+
+        Маппинг physics_phase → fitness ключ:
+            markup       → fitness_by_regime.get('markup', self.fitness_score)
+            accumulation → fitness_by_regime.get('accumulation', self.fitness_score)
+            distribution → fitness_by_regime.get('distribution', self.fitness_score)
+            markdown     → fitness_by_regime.get('markdown', self.fitness_score)
+            vapor        → fitness_by_regime.get('vapor', self.fitness_score)
+            ice          → fitness_by_regime.get('ice', self.fitness_score)
+        Неизвестная фаза → self.fitness_score (глобальный fallback)
+        """
+        known_phases = {"markup", "accumulation", "distribution", "markdown", "vapor", "ice"}
+        if physics_phase in known_phases:
+            return self.fitness_by_regime.get(physics_phase, self.fitness_score)
+        return self.fitness_score
+
+    def set_regime_fitness(self, physics_phase: str, score: float) -> None:
+        """Устанавливает fitness для конкретного physics_phase."""
+        self.fitness_by_regime[physics_phase] = score
 
     def clone(self) -> 'StrategyGenome':
         """Клонирование генома"""
@@ -217,6 +251,13 @@ class StrategyGenome:
             'win_rate': self.win_rate,
             'sharpe_ratio': self.sharpe_ratio,
             'max_drawdown': self.max_drawdown,
+            # Extended performance metrics
+            'calmar_ratio': self.calmar_ratio,
+            'omega_ratio': self.omega_ratio,
+            'sortino_ratio': self.sortino_ratio,
+            'trial_count': self.trial_count,
+            'wfa_efficiency': self.wfa_efficiency,
+            'fitness_by_regime': dict(self.fitness_by_regime),
             'created_at_ns': self.created_at_ns,
             'last_updated_ns': self.last_updated_ns,
             'alive': self.alive,
@@ -322,6 +363,13 @@ class StrategyGenome:
             win_rate=data.get('win_rate', 0.0),
             sharpe_ratio=data.get('sharpe_ratio', 0.0),
             max_drawdown=data.get('max_drawdown', 0.0),
+            # Extended performance metrics
+            calmar_ratio=data.get('calmar_ratio', 0.0),
+            omega_ratio=data.get('omega_ratio', 0.0),
+            sortino_ratio=data.get('sortino_ratio', 0.0),
+            trial_count=data.get('trial_count', 0),
+            wfa_efficiency=data.get('wfa_efficiency', 0.0),
+            fitness_by_regime=dict(data.get('fitness_by_regime', {})),
             created_at_ns=data.get('created_at_ns', 0),
             last_updated_ns=data.get('last_updated_ns', 0),
             alive=data.get('alive', True),

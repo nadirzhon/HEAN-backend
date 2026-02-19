@@ -4,10 +4,18 @@ Mutation Engine - Двигатель мутаций
 Создаёт вариации стратегий через мутации генов
 """
 
+from __future__ import annotations
+
+import math
 import random
 import time
+from collections import Counter
+
+from hean.logging import get_logger
 
 from .genome_types import Gene, GeneType, StrategyGenome
+
+logger = get_logger(__name__)
 
 
 class MutationEngine:
@@ -23,6 +31,9 @@ class MutationEngine:
         # Mutation statistics
         self.mutations_applied = 0
         self.successful_mutations = 0
+
+        # Adaptive rate tracking
+        self.last_diversity_ratio: float = 0.5
 
     def mutate(
         self,
@@ -255,6 +266,65 @@ class MutationEngine:
 
         return mutated
 
+    def compute_adaptive_rate(
+        self,
+        population: list[StrategyGenome],
+        diversity_ratio: float | None = None,
+    ) -> float:
+        """
+        Адаптивная mutation rate через Shannon Entropy популяции.
+
+        Источник: Goldberg & Richardson (1987) "Genetic Algorithms with Sharing
+        for Multimodal Function Optimization", ICGA Proceedings.
+
+        Формула:
+            H = -Σ_i p_i * log2(p_i)    # Shannon entropy по хэшам геномов
+            H_max = log2(N)              # максимальная энтропия при N геномах
+            diversity_ratio = H / H_max  # [0, 1], 0=все одинаковые, 1=все разные
+            rate = 0.05 + 0.25 * (1 - diversity_ratio)
+
+        Семантика:
+            - diversity_ratio → 0 (популяция сошлась к локальному оптимуму):
+              rate → 0.30 (высокая мутация для escape)
+            - diversity_ratio → 1 (популяция разнообразна):
+              rate → 0.05 (низкая мутация для exploitation)
+
+        Args:
+            population: текущая популяция геномов
+            diversity_ratio: если передан — использовать напрямую (для тестов)
+
+        Returns:
+            adaptive_rate в [0.05, 0.30]
+        """
+        if diversity_ratio is None:
+            n = len(population)
+            if n < 2:
+                # Degenerate case: single genome — treat as fully converged
+                diversity_ratio = 0.0
+            else:
+                # Compute Shannon entropy over genome hash frequency distribution
+                hash_counts = Counter(g.get_genome_hash() for g in population)
+                total = n
+                entropy = -sum(
+                    (count / total) * math.log2(count / total)
+                    for count in hash_counts.values()
+                )
+                h_max = math.log2(n)  # Maximum entropy when all genomes are unique
+                diversity_ratio = entropy / h_max if h_max > 0.0 else 0.0
+                # Clamp to [0, 1] against floating-point edge cases
+                diversity_ratio = max(0.0, min(1.0, diversity_ratio))
+
+        self.last_diversity_ratio = diversity_ratio
+        adaptive_rate = 0.05 + 0.25 * (1.0 - diversity_ratio)
+
+        logger.debug(
+            "compute_adaptive_rate: diversity_ratio=%.3f → rate=%.4f",
+            diversity_ratio,
+            adaptive_rate,
+        )
+
+        return adaptive_rate
+
     def get_statistics(self) -> dict:
         """Возвращает статистику мутаций"""
         success_rate = (
@@ -267,4 +337,6 @@ class MutationEngine:
             'successful_mutations': self.successful_mutations,
             'success_rate': success_rate,
             'base_mutation_rate': self.base_mutation_rate,
+            'current_adaptive_rate': 0.05 + 0.25 * (1.0 - self.last_diversity_ratio),
+            'last_diversity_ratio': self.last_diversity_ratio,
         }

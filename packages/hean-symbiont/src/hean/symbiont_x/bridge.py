@@ -1,14 +1,16 @@
 """Symbiont X Bridge - GA Optimization for Live Trading.
 
-Connects genetic algorithm optimization to live trading system:
-1. Collects real performance data from POSITION_CLOSED events
-2. Runs GA optimization in background to evolve strategy parameters
-3. Applies winning parameter sets via STRATEGY_PARAMS_UPDATED events
+Two bridge implementations:
 
-Pure Python GA implementation (no external deps):
-- Tournament selection
-- Uniform crossover
-- Gaussian mutation
+1. SymbiontXBridge — lightweight simpleGA bridge (original, wired in main.py
+   under settings.symbiont_x_enabled).
+
+2. SovereignSymbiont — full evolutionary bridge using the EvolutionEngine
+   (Phase 1A/1B/2A/2B work).  Listens to PHYSICS_UPDATE + TICK, runs
+   evolve_generation() periodically, promotes the best genome to live
+   strategies via STRATEGY_PARAMS_UPDATED when it clears the immune gate.
+
+   Wired in main.py under settings.symbiont_enabled (separate flag).
 """
 
 import asyncio
@@ -501,4 +503,404 @@ class SymbiontXBridge:
                 sid: len(history)
                 for sid, history in self._performance_history.items()
             },
+        }
+
+
+# ---------------------------------------------------------------------------
+# SovereignSymbiont — full evolutionary bridge (Phase 3: Live Wiring)
+# ---------------------------------------------------------------------------
+
+# Safe parameter bounds enforced by the immune gate (hardcoded, immutable).
+_IMMUNE_BOUNDS: dict[str, tuple[float, float]] = {
+    "stop_loss_pct": (0.001, 0.05),
+    "take_profit_pct": (0.002, 0.10),
+    "position_size_pct": (0.01, 0.25),
+    "leverage": (1.0, 10.0),
+    "risk_per_trade_pct": (0.005, 0.03),
+}
+
+
+class SovereignSymbiont:
+    """Full evolutionary bridge — EvolutionEngine wired to the live EventBus.
+
+    Lifecycle
+    ---------
+    1. ``start()`` — subscribes to PHYSICS_UPDATE + TICK, initialises population,
+       launches the background ``_evolution_loop`` task.
+    2. Every ``evolution_interval`` seconds the loop calls
+       ``engine.evolve_generation(current_physics_phase=...)``.
+    3. After each generation ``_try_promote_best_genome()`` checks whether the
+       best genome passes the immune gate and promotion thresholds, then
+       publishes ``STRATEGY_PARAMS_UPDATED`` if so.
+    4. ``stop()`` — cancels the background task and unsubscribes.
+
+    Immune gate
+    -----------
+    Hard bounds defined in ``_IMMUNE_BOUNDS`` are clamped regardless of what
+    the genome evolved to.  No parameter ever leaves the safe range.
+
+    Promotion conditions (both must be met)
+    ----------------------------------------
+    * ``genome.wfa_efficiency >= settings.symbiont_min_wfa_efficiency``
+    * composite fitness >= ``settings.symbiont_min_promotion_fitness``
+      (composite = weighted average of wfa_efficiency, calmar, omega, sortino)
+    """
+
+    def __init__(self, bus: Any, settings: Any) -> None:
+        self.bus = bus
+        self.settings = settings
+
+        # Lazy import — EvolutionEngine lives in hean-symbiont which may not
+        # be installed in all environments.
+        from hean.symbiont_x.genome_lab.evolution_engine import EvolutionEngine
+
+        pop_size = getattr(settings, "symbiont_population_size", 50)
+        elite_size = getattr(settings, "symbiont_elite_size", 5)
+
+        self.engine = EvolutionEngine(
+            population_size=pop_size,
+            elite_size=elite_size,
+        )
+
+        self._current_physics_phase: str = "unknown"
+        # Accumulate price returns for fitness evaluation (ring buffer, last 100)
+        self._recent_returns: deque[float] = deque(maxlen=100)
+        self._last_price: float | None = None
+        self._last_evolution_time: float = 0.0
+        self._promotions_count: int = 0
+        self._evolution_task: asyncio.Task[None] | None = None
+        self._running: bool = False
+
+    # ------------------------------------------------------------------
+    # Public lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Subscribe to events and initialise population."""
+        logger.info("[SovereignSymbiont] Starting — initialising population")
+        self.engine.initialize_population(base_name="SovGenome")
+
+        self.bus.subscribe(EventType.PHYSICS_UPDATE, self._handle_physics_update)
+        self.bus.subscribe(EventType.TICK, self._handle_tick)
+
+        self._running = True
+        self._evolution_task = asyncio.create_task(self._evolution_loop())
+        logger.info(
+            "[SovereignSymbiont] Started — pop=%d, interval=%ds",
+            len(self.engine.population),
+            getattr(self.settings, "symbiont_evolution_interval", 300),
+        )
+
+    async def stop(self) -> None:
+        """Graceful shutdown."""
+        self._running = False
+        if self._evolution_task is not None:
+            self._evolution_task.cancel()
+            try:
+                await self._evolution_task
+            except asyncio.CancelledError:
+                pass
+
+        self.bus.unsubscribe(EventType.PHYSICS_UPDATE, self._handle_physics_update)
+        self.bus.unsubscribe(EventType.TICK, self._handle_tick)
+
+        logger.info(
+            "[SovereignSymbiont] Stopped — promotions=%d, generation=%d",
+            self._promotions_count,
+            self.engine.generation_number,
+        )
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_physics_update(self, event: Event) -> None:
+        """Track current physics phase for regime-conditional selection."""
+        data = event.data
+        phase = data.get("phase") or data.get("physics_phase") or data.get("state", {}).get("phase")
+        if phase:
+            self._current_physics_phase = str(phase)
+            logger.debug("[SovereignSymbiont] Physics phase updated: %s", phase)
+
+    async def _handle_tick(self, event: Event) -> None:
+        """Accumulate log returns for fitness evaluation."""
+        price = event.data.get("price") or event.data.get("last_price")
+        if price is None:
+            return
+        price = float(price)
+        if self._last_price is not None and self._last_price > 0:
+            ret = (price - self._last_price) / self._last_price
+            self._recent_returns.append(ret)
+        self._last_price = price
+
+    # ------------------------------------------------------------------
+    # Evolution loop
+    # ------------------------------------------------------------------
+
+    async def _evolution_loop(self) -> None:
+        """Background asyncio task — evolves one generation every interval."""
+        interval: int = getattr(self.settings, "symbiont_evolution_interval", 300)
+
+        # Brief initial wait to let the system warm up and collect ticks.
+        initial_wait = min(interval, 60)
+        await asyncio.sleep(initial_wait)
+
+        while self._running:
+            try:
+                self._last_evolution_time = time.time()
+
+                # Evaluate current population with recent market returns.
+                self.engine.evolve_generation(
+                    fitness_evaluator=self._evaluate_genome,
+                    current_physics_phase=self._current_physics_phase
+                    if self._current_physics_phase != "unknown"
+                    else None,
+                )
+
+                logger.info(
+                    "[SovereignSymbiont] Generation %d complete — phase=%s, pop=%d",
+                    self.engine.generation_number,
+                    self._current_physics_phase,
+                    len(self.engine.population),
+                )
+
+                await self._try_promote_best_genome()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(
+                    "[SovereignSymbiont] Error in evolution loop: %s",
+                    exc,
+                    exc_info=True,
+                )
+
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+
+    # ------------------------------------------------------------------
+    # Fitness evaluation
+    # ------------------------------------------------------------------
+
+    def _evaluate_genome(self, genome: Any) -> float:
+        """Compute fitness from recent market returns.
+
+        Uses a simplified Sharpe-like score on the deque of log returns.
+        Returns a value in [0.0, 1.0] so it plays nicely alongside the
+        Pareto multi-objective machinery in EvolutionEngine.
+        """
+        returns = list(self._recent_returns)
+        if len(returns) < 5:
+            return 0.0
+
+        mean = sum(returns) / len(returns)
+        variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+        stddev = variance ** 0.5
+
+        if stddev == 0:
+            return 0.0
+
+        sharpe = mean / stddev
+
+        # Normalise to [0, 1] — clamp extreme values.
+        normalised = max(0.0, min(1.0, (sharpe + 3.0) / 6.0))
+        return normalised
+
+    # ------------------------------------------------------------------
+    # Immune gate
+    # ------------------------------------------------------------------
+
+    def _immune_gate(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Clamp all recognised parameters to hardcoded safe bounds.
+
+        Parameters outside ``_IMMUNE_BOUNDS`` are passed through unchanged.
+        No exception is raised — clamping is silent so the system is always safe.
+        """
+        safe: dict[str, Any] = {}
+        for key, value in params.items():
+            if key in _IMMUNE_BOUNDS:
+                lo, hi = _IMMUNE_BOUNDS[key]
+                try:
+                    clamped = float(value)
+                    clamped = max(lo, min(hi, clamped))
+                    safe[key] = clamped
+                    if clamped != float(value):
+                        logger.debug(
+                            "[SovereignSymbiont] Immune gate clamped %s: %.6f → %.6f",
+                            key,
+                            value,
+                            clamped,
+                        )
+                except (TypeError, ValueError):
+                    safe[key] = value
+            else:
+                safe[key] = value
+        return safe
+
+    # ------------------------------------------------------------------
+    # Promotion logic
+    # ------------------------------------------------------------------
+
+    async def _try_promote_best_genome(self) -> None:
+        """Check best genome and publish STRATEGY_PARAMS_UPDATED if it qualifies.
+
+        Promotion requires both:
+        1. ``genome.wfa_efficiency >= symbiont_min_wfa_efficiency``
+        2. Composite fitness (weighted average of wfa_efficiency, calmar,
+           omega, sortino) >= ``symbiont_min_promotion_fitness``
+
+        Parameters are clamped through the immune gate before publishing.
+        """
+        best = self.engine.best_genome_ever
+        if best is None and self.engine.population:
+            best = max(self.engine.population, key=lambda g: g.fitness_score)
+
+        if best is None:
+            return
+
+        min_wfa = float(getattr(self.settings, "symbiont_min_wfa_efficiency", 0.6))
+        min_fitness = float(getattr(self.settings, "symbiont_min_promotion_fitness", 0.7))
+
+        # --- Gate 1: WFA efficiency ---
+        if best.wfa_efficiency < min_wfa:
+            logger.debug(
+                "[SovereignSymbiont] Genome %s rejected — wfa_efficiency=%.3f < %.3f",
+                best.genome_id[:8],
+                best.wfa_efficiency,
+                min_wfa,
+            )
+            return
+
+        # --- Gate 2: Composite fitness ---
+        # Weighted blend: wfa(0.4) + calmar(0.2) + omega(0.2) + sortino(0.2)
+        # Each metric normalised to [0,1]:
+        #   calmar_norm = min(calmar/3, 1)  (calmar >3 is excellent)
+        #   omega_norm  = min((omega-1)/4, 1) (omega ranges 1-5 typically)
+        #   sortino_norm= min(sortino/3, 1)
+        wfa_n = min(1.0, max(0.0, best.wfa_efficiency))
+        calmar_n = min(1.0, max(0.0, best.calmar_ratio / 3.0)) if best.calmar_ratio > 0 else 0.0
+        omega_n = min(1.0, max(0.0, (best.omega_ratio - 1.0) / 4.0)) if best.omega_ratio > 1 else 0.0
+        sortino_n = min(1.0, max(0.0, best.sortino_ratio / 3.0)) if best.sortino_ratio > 0 else 0.0
+
+        composite = 0.4 * wfa_n + 0.2 * calmar_n + 0.2 * omega_n + 0.2 * sortino_n
+
+        if composite < min_fitness:
+            logger.debug(
+                "[SovereignSymbiont] Genome %s rejected — composite=%.3f < %.3f "
+                "(wfa=%.3f, calmar=%.3f, omega=%.3f, sortino=%.3f)",
+                best.genome_id[:8],
+                composite,
+                min_fitness,
+                wfa_n,
+                calmar_n,
+                omega_n,
+                sortino_n,
+            )
+            return
+
+        # --- Passed both gates — extract tradeable params from genome ---
+        raw_params = self._extract_tradeable_params(best)
+        if not raw_params:
+            logger.debug("[SovereignSymbiont] Best genome has no tradeable genes — skipping promotion")
+            return
+
+        safe_params = self._immune_gate(raw_params)
+
+        logger.info(
+            "[SovereignSymbiont] PROMOTING genome %s — "
+            "gen=%d, wfa=%.3f, composite=%.3f — params=%s",
+            best.genome_id[:8],
+            best.generation,
+            best.wfa_efficiency,
+            composite,
+            safe_params,
+        )
+
+        await self.bus.publish(
+            Event(
+                event_type=EventType.STRATEGY_PARAMS_UPDATED,
+                data={
+                    "strategy_id": "sovereign_symbiont",
+                    "genome_id": best.genome_id,
+                    "params": safe_params,
+                    "source": "sovereign_symbiont",
+                    "generation": best.generation,
+                    "wfa_efficiency": best.wfa_efficiency,
+                    "composite_fitness": composite,
+                    "physics_phase": self._current_physics_phase,
+                },
+            )
+        )
+        self._promotions_count += 1
+
+    def _extract_tradeable_params(self, genome: Any) -> dict[str, float]:
+        """Pull the five tradeable genes from a StrategyGenome.
+
+        Only genes whose names match the immune-gate keys are extracted.
+        If a gene has a percentage-scaled value (e.g. stop_loss stored as
+        2.5 meaning 2.5%), we divide by 100 to normalise to decimal form
+        matching the immune gate bounds.
+        """
+        from hean.symbiont_x.genome_lab.genome_types import GeneType
+
+        gene_map = {
+            GeneType.STOP_LOSS: "stop_loss_pct",
+            GeneType.TAKE_PROFIT: "take_profit_pct",
+            GeneType.POSITION_SIZE: "position_size_pct",
+            GeneType.LEVERAGE: "leverage",
+            GeneType.RISK_PER_TRADE: "risk_per_trade_pct",
+        }
+
+        params: dict[str, float] = {}
+        for gene_type, param_name in gene_map.items():
+            gene = genome.get_gene(gene_type)
+            if gene is not None:
+                try:
+                    raw_val = float(gene.value)
+                    # Gene values stored as percentages (e.g. 2.5 for 2.5%).
+                    # Immune gate expects decimal (0.025).
+                    # Heuristic: if value > 1 and param_name ends with '_pct'
+                    # and the gene is not 'leverage', convert by dividing by 100.
+                    if (
+                        param_name.endswith("_pct")
+                        and raw_val > 1.0
+                    ):
+                        raw_val = raw_val / 100.0
+                    params[param_name] = raw_val
+                except (TypeError, ValueError):
+                    pass
+
+        return params
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    def get_statistics(self) -> dict[str, Any]:
+        """Return statistics dict for API / monitoring."""
+        engine_stats = self.engine.get_statistics()
+        best = self.engine.best_genome_ever
+
+        return {
+            "running": self._running,
+            "current_physics_phase": self._current_physics_phase,
+            "recent_returns_count": len(self._recent_returns),
+            "last_evolution_time": self._last_evolution_time,
+            "promotions_count": self._promotions_count,
+            "generation_number": self.engine.generation_number,
+            "population_size": len(self.engine.population),
+            "best_genome": {
+                "genome_id": best.genome_id[:8] if best else None,
+                "generation": best.generation if best else None,
+                "fitness_score": best.fitness_score if best else None,
+                "wfa_efficiency": best.wfa_efficiency if best else None,
+                "calmar_ratio": best.calmar_ratio if best else None,
+                "omega_ratio": best.omega_ratio if best else None,
+                "sortino_ratio": best.sortino_ratio if best else None,
+            },
+            "diversity_score": engine_stats.get("diversity_score"),
+            "total_genomes_created": engine_stats.get("total_genomes_created"),
+            "total_genomes_killed": engine_stats.get("total_genomes_killed"),
         }

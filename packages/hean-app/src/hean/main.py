@@ -18,6 +18,7 @@ from hean.config import settings
 from hean.core.arb.triangular_scanner import TriangularScanner
 from hean.core.bus import EventBus
 from hean.core.clock import Clock
+from hean.core.fabric import CausalRegistry, EEVScorer, EventDNA, extract_dna, inject_dna
 from hean.core.intelligence.causal_inference_engine import CausalInferenceEngine
 from hean.core.intelligence.correlation_engine import CorrelationEngine
 from hean.core.intelligence.meta_learning_engine import MetaLearningEngine
@@ -159,6 +160,11 @@ class TradingSystem:
         # Trade Council 2.0 (real-time adversarial signal evaluation)
         self._trade_council = None
 
+        # Temporal Event Fabric (causal DNA + EEV scoring)
+        self._fabric_registry: CausalRegistry | None = None
+        self._fabric_eev: EEVScorer | None = None
+        self._fabric_tick_dna: dict[str, EventDNA] = {}  # symbol → last TICK DNA
+
         # ARCHON — Brain-Orchestrator
         self._archon: Any = None  # TYPE_CHECKING import to avoid circular dependency
 
@@ -191,6 +197,9 @@ class TradingSystem:
         self._anomaly_detector = None
         self._temporal_stack = None
         self._cross_market = None
+
+        # SovereignSymbiont — Phase 3 live wiring (optional)
+        self._sovereign_symbiont: Any = None
 
         # Digital Organism components
         self._market_genome_detector = None
@@ -574,22 +583,55 @@ class TradingSystem:
         elif self._mode == "run":
             logger.info("Physics source=redis, skipping in-process PhysicsEngine")
 
-        # Brain: Claude AI market analysis
+        # Brain: AI market analysis (SovereignBrain or ClaudeBrainClient)
+        # Selection logic:
+        #   1. sovereign_brain_enabled=True → always SovereignBrain
+        #   2. groq/deepseek/openrouter/ollama key present AND no anthropic key → SovereignBrain
+        #   3. anthropic_api_key present → ClaudeBrainClient (legacy)
+        #   4. nothing → skip brain
         self._brain_client = None
         if self._mode == "run" and getattr(settings, 'brain_enabled', True) and not use_redis_brain:
             try:
-                from hean.brain.claude_client import ClaudeBrainClient
-
-                self._brain_client = ClaudeBrainClient(
-                    bus=self._bus,
-                    api_key=getattr(settings, 'anthropic_api_key', ''),
-                    analysis_interval=getattr(settings, 'brain_analysis_interval', 60),
-                    openrouter_api_key=getattr(settings, 'openrouter_api_key', ''),
+                use_sovereign = bool(getattr(settings, 'sovereign_brain_enabled', False))
+                has_sovereign_providers = bool(
+                    getattr(settings, 'groq_api_key', '')
+                    or getattr(settings, 'deepseek_api_key', '')
+                    or getattr(settings, 'openrouter_api_key', '')
+                    or getattr(settings, 'ollama_enabled', False)
                 )
-                await self._brain_client.start()
-                logger.info("Brain Client started")
+                anthropic_key = str(getattr(settings, 'anthropic_api_key', '') or '')
+
+                if use_sovereign or (has_sovereign_providers and not anthropic_key):
+                    try:
+                        from hean.brain.sovereign_brain import SovereignBrain
+
+                        self._brain_client = SovereignBrain(bus=self._bus, settings=settings)
+                        await self._brain_client.start()
+                        providers = getattr(self._brain_client, 'active_providers', [])
+                        logger.info("SovereignBrain started (independent) | providers=%s", providers)
+                    except ImportError as imp_err:
+                        logger.warning("SovereignBrain not available (%s) — falling back to ClaudeBrainClient", imp_err)
+                        from hean.brain.claude_client import ClaudeBrainClient
+                        self._brain_client = ClaudeBrainClient(
+                            bus=self._bus,
+                            api_key=anthropic_key,
+                            analysis_interval=getattr(settings, 'brain_analysis_interval', 60),
+                            openrouter_api_key=getattr(settings, 'openrouter_api_key', ''),
+                        )
+                        await self._brain_client.start()
+                        logger.info("Brain Client started (ClaudeBrainClient fallback)")
+                else:
+                    from hean.brain.claude_client import ClaudeBrainClient
+                    self._brain_client = ClaudeBrainClient(
+                        bus=self._bus,
+                        api_key=anthropic_key,
+                        analysis_interval=getattr(settings, 'brain_analysis_interval', 60),
+                        openrouter_api_key=getattr(settings, 'openrouter_api_key', ''),
+                    )
+                    await self._brain_client.start()
+                    logger.info("Brain Client started (ClaudeBrainClient)")
             except Exception as e:
-                logger.warning(f"Brain Client failed to start: {e}")
+                logger.warning("Brain Client failed to start: %s", e)
         elif self._mode == "run" and use_redis_brain:
             logger.info("Brain source=redis, skipping in-process Brain Client")
 
@@ -902,6 +944,22 @@ class TradingSystem:
             except Exception as e:
                 logger.warning(f"Symbiont X Bridge failed to start: {e}")
 
+        # SovereignSymbiont — Phase 3 live wiring (full EvolutionEngine bridge)
+        if self._mode == "run" and getattr(settings, "symbiont_enabled", False):
+            try:
+                from hean.symbiont_x.bridge import SovereignSymbiont
+                self._sovereign_symbiont = SovereignSymbiont(bus=self._bus, settings=settings)
+                await self._sovereign_symbiont.start()
+                logger.info(
+                    "SovereignSymbiont started (pop=%d, interval=%ds)",
+                    getattr(settings, "symbiont_population_size", 50),
+                    getattr(settings, "symbiont_evolution_interval", 300),
+                )
+            except ImportError as e:
+                logger.warning("SovereignSymbiont not available (missing deps): %s", e)
+            except Exception as e:
+                logger.warning("SovereignSymbiont failed to start: %s", e)
+
         # Digital Organism: DoomsdaySandbox (Stage 2)
         if self._mode == "run" and settings.doomsday_sandbox_enabled:
             try:
@@ -1180,6 +1238,12 @@ class TradingSystem:
             except Exception as e:
                 logger.warning(f"Could not start Trade Council: {e}")
 
+        # Temporal Event Fabric — causal genome tracking + EEV priority
+        if settings.fabric_enabled:
+            self._fabric_registry = CausalRegistry(maxsize=20_000)
+            self._fabric_eev = EEVScorer()
+            logger.info("Temporal Event Fabric enabled (DNA tracking + EEV scoring)")
+
         # ARCHON — Central Brain-Orchestrator
         if settings.archon_enabled:
             try:
@@ -1349,6 +1413,8 @@ class TradingSystem:
             await self._risk_governor.stop()
         if hasattr(self, '_symbiont_x_bridge') and self._symbiont_x_bridge:
             await self._symbiont_x_bridge.stop()
+        if hasattr(self, '_sovereign_symbiont') and self._sovereign_symbiont:
+            await self._sovereign_symbiont.stop()
 
         # Stop Digital Organism components
         if self._market_genome_detector:
@@ -1386,6 +1452,16 @@ class TradingSystem:
         """
         signal: Signal = event.data["signal"]
         logger.debug(f"[ENRICHED] Signal received: {signal.strategy_id} {signal.symbol} {signal.side}")
+
+        # Fabric: spawn SIGNAL DNA from cached TICK parent
+        signal_dna: EventDNA | None = None
+        if self._fabric_registry is not None:
+            parent = self._fabric_tick_dna.get(signal.symbol)
+            if parent:
+                signal_dna = self._fabric_registry.spawn(parent.event_id, event)
+            else:
+                signal_dna = self._fabric_registry.register(event)
+            inject_dna(event, signal_dna)
 
         # === 1. Mandatory stop_loss validation ===
         if signal.stop_loss is None:
@@ -1737,12 +1813,15 @@ class TradingSystem:
             f"size={size:.6f} @ {current_price:.2f} "
             f"(risk_mult={risk_size_multiplier:.2f}, intel_boost={intelligence_boost:.2f})"
         )
-        await self._bus.publish(
-            Event(
-                event_type=EventType.ORDER_REQUEST,
-                data={"order_request": order_request},
-            )
+        order_event = Event(
+            event_type=EventType.ORDER_REQUEST,
+            data={"order_request": order_request},
         )
+        # Fabric: spawn ORDER_REQUEST DNA from SIGNAL parent
+        if self._fabric_registry is not None and signal_dna is not None:
+            or_dna = self._fabric_registry.spawn(signal_dna.event_id, order_event)
+            inject_dna(order_event, or_dna)
+        await self._bus.publish(order_event)
         metrics.increment("signals_accepted")
         log_allow_reason(
             "ALLOW", symbol=signal.symbol, strategy_id=signal.strategy_id,
@@ -2530,6 +2609,15 @@ class TradingSystem:
             f"size={order.size}, fill_price={fill_price:.2f}, fee={fee:.4f}"
         )
 
+        # Fabric: spawn ORDER_FILLED DNA from event's parent DNA (if present)
+        if self._fabric_registry is not None:
+            parent_dna = extract_dna(event)
+            if parent_dna:
+                fill_dna = self._fabric_registry.spawn(parent_dna.event_id, event)
+            else:
+                fill_dna = self._fabric_registry.register(event)
+            inject_dna(event, fill_dna)
+
         # DEBUG: Track order fills
         self._orders_filled += 1
         metrics.increment("orders_filled_total")
@@ -2640,12 +2728,24 @@ class TradingSystem:
                 f"{position.side} {position.size} {position.symbol} @ {position.entry_price:.2f}"
             )
 
-            await self._bus.publish(
-                Event(
-                    event_type=EventType.POSITION_OPENED,
-                    data={"position": position},
-                )
+            pos_event = Event(
+                event_type=EventType.POSITION_OPENED,
+                data={"position": position},
             )
+            # Fabric: propagate DNA from fill → POSITION_OPENED
+            if self._fabric_registry is not None:
+                fill_parent = extract_dna(event)
+                if fill_parent:
+                    pos_dna = self._fabric_registry.spawn(fill_parent.event_id, pos_event)
+                else:
+                    pos_dna = self._fabric_registry.register(pos_event)
+                inject_dna(pos_event, pos_dna)
+                # Store DNA IDs in position metadata for retrieval at POSITION_CLOSED
+                if position.metadata is None:
+                    position.metadata = {}
+                position.metadata["_fabric_trace_id"] = pos_dna.trace_id
+                position.metadata["_fabric_event_id"] = pos_dna.event_id
+            await self._bus.publish(pos_event)
 
             metrics.increment("positions_opened")
             no_trade_report.increment_pipeline("positions_opened", order.strategy_id)
@@ -2758,6 +2858,32 @@ class TradingSystem:
                     f"New Equity=${self._accounting.get_equity():.2f}, "
                     f"Drawdown={drawdown_pct:.1f}%, PF={rolling_pf:.2f}"
                 )
+
+        # Fabric: complete causal chain and credit EEV with realized PnL
+        if self._fabric_registry is not None and self._fabric_eev is not None:
+            # Recover event_id from position metadata (stored at POSITION_OPENED)
+            fabric_event_id = (position.metadata or {}).get("_fabric_event_id")
+            if fabric_event_id:
+                # Get lineage before completing (complete_chain doesn't return it)
+                pos_dna = self._fabric_registry._registry.get(fabric_event_id)
+                lineage = pos_dna.lineage if pos_dna else []
+                # Complete chain with outcome
+                self._fabric_registry.complete_chain(
+                    fabric_event_id,
+                    {"pnl": position.realized_pnl, "symbol": position.symbol},
+                )
+                # Credit EEV with depth-decayed PnL across all ancestor fingerprints
+                if lineage:
+                    phase = regime.value if regime else "*"
+                    credited = self._fabric_eev.credit_chain(
+                        lineage, position.symbol, position.realized_pnl,
+                        metadata={"phase": phase},
+                    )
+                    logger.debug(
+                        f"[FABRIC] Chain completed: event={fabric_event_id[:8]}… "
+                        f"lineage={lineage} pnl={position.realized_pnl:.4f} "
+                        f"credited={credited} fingerprints"
+                    )
 
         metrics.increment("positions_closed")
         no_trade_report.increment_pipeline("positions_closed", position.strategy_id)
@@ -3097,6 +3223,12 @@ class TradingSystem:
         symbol = tick.symbol
         now = datetime.utcnow()
         self._last_tick_at[symbol] = now
+
+        # Fabric: register DNA root for this TICK and cache per-symbol
+        if self._fabric_registry is not None:
+            dna = self._fabric_registry.register(event)
+            inject_dna(event, dna)
+            self._fabric_tick_dna[symbol] = dna
 
         # Mark-to-market update for open positions on this symbol
         for position in self._accounting.get_positions():

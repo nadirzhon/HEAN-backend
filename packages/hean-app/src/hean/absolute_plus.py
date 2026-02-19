@@ -296,7 +296,13 @@ class AbsolutePlusSystem:
 
     def run(self):
         """Run the system (blocking)"""
-        loop = asyncio.get_event_loop()
+        # Create a fresh event loop explicitly.  asyncio.get_event_loop() is
+        # deprecated in Python 3.10+ when there is no current event loop set
+        # for the calling thread and raises a DeprecationWarning (RuntimeError
+        # in 3.12+).  Using asyncio.new_event_loop() + set_event_loop() is the
+        # correct pattern for top-level sync entrypoints.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
         try:
             loop.run_until_complete(self.start())

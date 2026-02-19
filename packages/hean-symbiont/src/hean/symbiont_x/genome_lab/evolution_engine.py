@@ -4,14 +4,20 @@ Evolution Engine - Двигатель эволюции
 Координирует весь процесс эволюции: популяция, селекция, мутации, скрещивание
 """
 
+from __future__ import annotations
+
 import time
 from collections import deque
 from collections.abc import Callable
+
+from hean.logging import get_logger
 
 from .crossover import CrossoverEngine
 from .genome_types import StrategyGenome, create_random_genome
 from .multi_objective import IslandModel, ParetoRanker
 from .mutation_engine import MutationEngine
+
+logger = get_logger(__name__)
 
 
 class EvolutionEngine:
@@ -81,13 +87,17 @@ class EvolutionEngine:
 
     def evolve_generation(
         self,
-        fitness_evaluator: Callable[[StrategyGenome], float] | None = None
+        fitness_evaluator: Callable[[StrategyGenome], float] | None = None,
+        current_physics_phase: str | None = None,
     ) -> list[StrategyGenome]:
         """
         Эволюционирует одно поколение
 
         Args:
             fitness_evaluator: Функция для оценки fitness (если не уже установлен)
+            current_physics_phase: Текущая physics phase (markup/accumulation/distribution/
+                markdown/vapor/ice). Если передана — selection использует regime-conditional
+                fitness вместо глобального fitness_score.
 
         Returns:
             Новая популяция
@@ -103,11 +113,47 @@ class EvolutionEngine:
                 if genome.fitness_score == 0:
                     genome.fitness_score = fitness_evaluator(genome)
 
-        # Selection: Pareto-отбор (если включён) или стандартный
-        survivors = self._selection_pareto() if self.pareto_ranker else self._selection()
+        # Selection: Pareto-отбор (если включён) или стандартный.
+        # Если передана physics_phase — временно подменяем fitness_score на
+        # regime-specific значение, чтобы NSGA-II отбирал геномы, лучшие
+        # именно для текущего рыночного режима.
+        if current_physics_phase and self.pareto_ranker:
+            logger.info(
+                "Generation %d: regime-conditional selection (phase=%s)",
+                self.generation_number,
+                current_physics_phase,
+            )
+            for genome in self.population:
+                genome._temp_global_fitness = genome.fitness_score  # type: ignore[attr-defined]
+                genome.fitness_score = genome.get_regime_fitness(current_physics_phase)
+
+            survivors = self._selection_pareto()
+
+            for genome in self.population:
+                genome.fitness_score = getattr(
+                    genome, "_temp_global_fitness", genome.fitness_score
+                )
+        else:
+            survivors = self._selection_pareto() if self.pareto_ranker else self._selection()
 
         # Elitism - сохраняем лучших без изменений
         elite = self._elitism(survivors)
+
+        # Adaptive mutation rate based on population diversity (Shannon Entropy)
+        diversity = self.get_diversity_score()
+        adaptive_rate = self.mutation_engine.compute_adaptive_rate(
+            self.population,
+            diversity_ratio=diversity,
+        )
+        # Temporarily set the rate for this generation
+        self.mutation_engine.base_mutation_rate = adaptive_rate
+
+        logger.debug(
+            "Generation %d: diversity=%.3f → adaptive_mutation_rate=%.4f",
+            self.generation_number,
+            diversity,
+            adaptive_rate,
+        )
 
         # Reproduction - создаём новых потомков
         offspring = self._reproduction(survivors)
@@ -325,6 +371,7 @@ class EvolutionEngine:
             'best_genome_ever': self.best_genome_ever.to_dict() if self.best_genome_ever else None,
             'mutation_stats': self.mutation_engine.get_statistics(),
             'crossover_stats': self.crossover_engine.get_statistics(),
+            'diversity_score': self.get_diversity_score(),
         }
 
         # Add generation history

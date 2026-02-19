@@ -494,3 +494,125 @@ def test_calculate_size_v2_intelligence_boost() -> None:
     )
 
     assert size_boosted > size_normal
+
+
+# ============================================================================
+# Startup race condition fix tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_sentinel_envelope_cached_before_publish() -> None:
+    """get_envelope() returns non-None immediately after start(), before publish.
+
+    Regression guard for the startup race fix: RiskSentinel.start() must
+    compute and cache the envelope so that synchronous callers (e.g. the
+    execution router's final gate check) can read it before the initial
+    event publish has happened.
+    """
+    bus = EventBus()
+    await bus.start()
+
+    sentinel = RiskSentinel(
+        bus=bus,
+        accounting=_mock_accounting(equity=5000.0),
+        killswitch=_mock_killswitch(triggered=False),
+    )
+    await sentinel.start()
+
+    # Envelope must be available synchronously after start() — publish deferred
+    envelope = sentinel.get_envelope()
+    assert envelope is not None, "Envelope must be cached immediately after start()"
+    assert envelope.equity == 5000.0
+
+    await sentinel.stop()
+    await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_sentinel_publish_initial_envelope_reaches_late_subscribers() -> None:
+    """Subscribers registered after start() receive the initial envelope.
+
+    This is the core of the startup race fix: strategies subscribe to
+    RISK_ENVELOPE in their own start() calls which happen AFTER
+    RiskSentinel.start().  publish_initial_envelope() must be called after
+    all strategies have started so they receive it.
+    """
+    bus = EventBus()
+    await bus.start()
+
+    sentinel = RiskSentinel(
+        bus=bus,
+        accounting=_mock_accounting(equity=7500.0),
+        killswitch=_mock_killswitch(triggered=False),
+    )
+    await sentinel.start()
+
+    # Simulate a strategy subscribing AFTER sentinel.start()
+    received_envelopes: list[RiskEnvelope] = []
+
+    async def late_subscriber(event: Event) -> None:
+        env = event.data.get("envelope")
+        if env is not None:
+            received_envelopes.append(env)
+
+    bus.subscribe(EventType.RISK_ENVELOPE, late_subscriber)
+
+    # Now publish the initial envelope — simulates TradingSystem calling
+    # this after all Strategy.start() calls complete.
+    await sentinel.publish_initial_envelope()
+
+    # Give the event loop a chance to process the queued event
+    await asyncio.sleep(0.05)
+
+    assert len(received_envelopes) >= 1, (
+        "Late subscriber (strategy) must receive initial RISK_ENVELOPE event"
+    )
+    assert received_envelopes[0].equity == 7500.0
+
+    await sentinel.stop()
+    await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_sentinel_no_envelope_event_before_explicit_publish() -> None:
+    """No RISK_ENVELOPE event is published by start() alone.
+
+    Ensures the fix doesn't silently fire the event before strategies subscribe.
+    The event must only appear after publish_initial_envelope() is called.
+    """
+    bus = EventBus()
+    await bus.start()
+
+    premature_events: list[Event] = []
+
+    # Subscribe BEFORE start() — captures any premature publish
+    async def early_listener(event: Event) -> None:
+        premature_events.append(event)
+
+    bus.subscribe(EventType.RISK_ENVELOPE, early_listener)
+
+    sentinel = RiskSentinel(
+        bus=bus,
+        accounting=_mock_accounting(),
+        killswitch=_mock_killswitch(triggered=False),
+    )
+    await sentinel.start()
+
+    # Give the event queue time to drain — start() must NOT publish
+    await asyncio.sleep(0.05)
+
+    # The event must not have arrived yet (start() only computes, not publishes)
+    assert len(premature_events) == 0, (
+        "start() must NOT publish RISK_ENVELOPE — that causes strategies to miss it"
+    )
+
+    # Now explicitly publish — this is what TradingSystem does after strategies start
+    await sentinel.publish_initial_envelope()
+    await asyncio.sleep(0.05)
+
+    # Now it should have arrived
+    assert len(premature_events) == 1
+
+    await sentinel.stop()
+    await bus.stop()

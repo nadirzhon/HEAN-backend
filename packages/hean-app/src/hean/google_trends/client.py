@@ -50,7 +50,7 @@ class GoogleTrendsClient:
             from pytrends.request import TrendReq
 
             # Run in executor (blocking operation)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self._pytrends = await loop.run_in_executor(
                 None,
                 lambda: TrendReq(hl=self.language, tz=self.timezone_offset)
@@ -110,7 +110,7 @@ class GoogleTrendsClient:
 
         try:
             # Build payload
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             # Run blocking operation in executor
             await loop.run_in_executor(
@@ -160,7 +160,7 @@ class GoogleTrendsClient:
     async def _get_related_queries(self, keyword: str) -> dict:
         """Get related queries for keyword"""
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             related_dict = await loop.run_in_executor(
                 None,
                 self._pytrends.related_queries
@@ -217,7 +217,7 @@ class GoogleTrendsClient:
         await self._rate_limit()
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             # Build payload
             await loop.run_in_executor(

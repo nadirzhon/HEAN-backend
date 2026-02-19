@@ -4,10 +4,16 @@ Survival Score Calculator - Калькулятор финального survival
 Объединяет результаты всех тестовых миров и стресс-тестов
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .stress_tests import StressTestResult
 from .test_worlds import TestResult
+
+if TYPE_CHECKING:
+    from hean.symbiont_x.backtesting.walk_forward import WalkForwardResult
 
 
 @dataclass
@@ -34,17 +40,21 @@ class SurvivalScore:
     paper_score: float        # Paper trading performance
     micro_real_score: float   # Micro-real performance
     robustness_score: float   # Stress tests
+    wfa_score: float = 0.0    # Walk-Forward Anchored score (optional, 0 when not computed)
 
     # Test results
-    replay_result: TestResult
-    paper_result: TestResult
-    micro_real_result: TestResult
-    stress_test_results: list[StressTestResult]
+    replay_result: TestResult | None = None
+    paper_result: TestResult | None = None
+    micro_real_result: TestResult | None = None
+    stress_test_results: list[StressTestResult] = field(default_factory=list)
+
+    # Walk-Forward result (optional)
+    wfa_result: WalkForwardResult | None = None
 
     # Flags
-    ready_for_production: bool
-    requires_improvement: bool
-    critical_failures: list[str]
+    ready_for_production: bool = False
+    requires_improvement: bool = True
+    critical_failures: list[str] = field(default_factory=list)
 
     def get_level(self) -> str:
         """Возвращает уровень готовности"""
@@ -61,21 +71,30 @@ class SurvivalScore:
 
     def to_dict(self) -> dict:
         """Сериализация"""
-        return {
+        component_scores: dict = {
+            'replay': self.replay_score,
+            'paper': self.paper_score,
+            'micro_real': self.micro_real_score,
+            'robustness': self.robustness_score,
+        }
+        if self.wfa_result is not None:
+            component_scores['wfa'] = self.wfa_score
+
+        result: dict = {
             'strategy_id': self.strategy_id,
             'strategy_name': self.strategy_name,
             'overall_score': self.overall_score,
             'level': self.get_level(),
-            'component_scores': {
-                'replay': self.replay_score,
-                'paper': self.paper_score,
-                'micro_real': self.micro_real_score,
-                'robustness': self.robustness_score,
-            },
+            'component_scores': component_scores,
             'ready_for_production': self.ready_for_production,
             'requires_improvement': self.requires_improvement,
             'critical_failures': self.critical_failures,
         }
+
+        if self.wfa_result is not None:
+            result['wfa'] = self.wfa_result.to_dict()
+
+        return result
 
 
 class SurvivalScoreCalculator:
@@ -86,12 +105,22 @@ class SurvivalScoreCalculator:
     """
 
     def __init__(self):
-        # Weights for different test types
+        # Default weights (without WFA).  When WFA result is supplied, weights are
+        # overridden inside calculate() to include the WFA component.
         self.weights = {
             'replay': 0.20,       # 20% - базовая валидация
             'paper': 0.30,        # 30% - реалистичное тестирование
             'micro_real': 0.35,   # 35% - реальные деньги (самое важное)
             'robustness': 0.15,   # 15% - стресс-тесты
+        }
+
+        # Weights when WFA result is provided (sum = 1.0)
+        self.weights_with_wfa = {
+            'replay': 0.15,       # 15% - базовая валидация
+            'paper': 0.25,        # 25% - реалистичное тестирование
+            'micro_real': 0.30,   # 30% - реальные деньги
+            'robustness': 0.10,   # 10% - стресс-тесты
+            'wfa': 0.20,          # 20% - walk-forward anti-overfitting (новый)
         }
 
         # Minimum scores to pass
@@ -108,18 +137,22 @@ class SurvivalScoreCalculator:
         paper_result: TestResult,
         micro_real_result: TestResult,
         stress_test_results: list[StressTestResult],
+        wfa_result: WalkForwardResult | None = None,
     ) -> SurvivalScore:
         """
-        Вычисляет финальный Survival Score
+        Вычисляет финальный Survival Score.
 
         Args:
-            replay_result: Результат Replay World
-            paper_result: Результат Paper World
-            micro_real_result: Результат Micro-Real World
-            stress_test_results: Результаты стресс-тестов
+            replay_result: Результат Replay World.
+            paper_result: Результат Paper World.
+            micro_real_result: Результат Micro-Real World.
+            stress_test_results: Результаты стресс-тестов.
+            wfa_result: (опционально) Результат Walk-Forward Anchored валидации.
+                Если передан — перераспределяет веса компонентов и добавляет
+                WFA как отдельный компонент с весом 0.20.
 
         Returns:
-            SurvivalScore
+            SurvivalScore с обновлёнными весами и WFA метриками (если передан).
         """
 
         # Calculate component scores (0-100)
@@ -128,26 +161,53 @@ class SurvivalScoreCalculator:
         micro_real_score = self._score_test_result(micro_real_result) * 100
         robustness_score = self._score_stress_tests(stress_test_results) * 100
 
-        # Weighted overall score
-        overall_score = (
-            replay_score * self.weights['replay'] +
-            paper_score * self.weights['paper'] +
-            micro_real_score * self.weights['micro_real'] +
-            robustness_score * self.weights['robustness']
+        # Identify critical failures (base failures before WFA)
+        critical_failures = self._identify_critical_failures(
+            replay_result, paper_result, micro_real_result, stress_test_results
         )
+
+        if wfa_result is not None:
+            # Convert WFA efficiency ratio → 0-100 score.
+            # wfa_efficiency is in [0.0, 1.5]; we normalise to [0, 100] capped at 100.
+            wfa_score = min(wfa_result.wfa_efficiency * 100.0, 100.0)
+
+            # Use redistributed weights that include WFA
+            w = self.weights_with_wfa
+
+            overall_score = (
+                replay_score * w['replay'] +
+                paper_score * w['paper'] +
+                micro_real_score * w['micro_real'] +
+                robustness_score * w['robustness'] +
+                wfa_score * w['wfa']
+            )
+
+            # WFA failure is a critical failure
+            if not wfa_result.passed:
+                critical_failures.append(
+                    f"Walk-Forward validation failed: {wfa_result.failure_reason}"
+                )
+        else:
+            wfa_score = 0.0
+
+            # Use default weights without WFA
+            w = self.weights
+
+            overall_score = (
+                replay_score * w['replay'] +
+                paper_score * w['paper'] +
+                micro_real_score * w['micro_real'] +
+                robustness_score * w['robustness']
+            )
 
         # Check if ready for production
         ready_for_production = self._check_ready_for_production(
-            replay_score, paper_score, micro_real_score, robustness_score
+            replay_score, paper_score, micro_real_score, robustness_score,
+            wfa_result=wfa_result,
         )
 
         # Check if requires improvement
         requires_improvement = overall_score < 75
-
-        # Identify critical failures
-        critical_failures = self._identify_critical_failures(
-            replay_result, paper_result, micro_real_result, stress_test_results
-        )
 
         return SurvivalScore(
             strategy_id=micro_real_result.strategy_id,
@@ -157,10 +217,12 @@ class SurvivalScoreCalculator:
             paper_score=paper_score,
             micro_real_score=micro_real_score,
             robustness_score=robustness_score,
+            wfa_score=wfa_score,
             replay_result=replay_result,
             paper_result=paper_result,
             micro_real_result=micro_real_result,
             stress_test_results=stress_test_results,
+            wfa_result=wfa_result,
             ready_for_production=ready_for_production,
             requires_improvement=requires_improvement,
             critical_failures=critical_failures,
@@ -211,20 +273,27 @@ class SurvivalScoreCalculator:
         replay_score: float,
         paper_score: float,
         micro_real_score: float,
-        robustness_score: float
+        robustness_score: float,
+        wfa_result: WalkForwardResult | None = None,
     ) -> bool:
         """
-        Проверяет готовность к production
+        Проверяет готовность к production.
 
-        Все минимумы должны быть достигнуты
+        Все компонентные минимумы должны быть достигнуты.
+        Если wfa_result передан — дополнительно требует wfa_result.passed == True.
         """
 
-        return (
+        base_ready = (
             replay_score >= self.min_scores['replay'] and
             paper_score >= self.min_scores['paper'] and
             micro_real_score >= self.min_scores['micro_real'] and
             robustness_score >= self.min_scores['robustness']
         )
+
+        if wfa_result is not None:
+            return base_ready and wfa_result.passed
+
+        return base_ready
 
     def _identify_critical_failures(
         self,
@@ -292,6 +361,7 @@ class SurvivalScoreCalculator:
                 paper_result=results['paper'],
                 micro_real_result=results['micro_real'],
                 stress_test_results=results['stress_tests'],
+                wfa_result=results.get('wfa_result'),
             )
             survival_scores.append(score)
 

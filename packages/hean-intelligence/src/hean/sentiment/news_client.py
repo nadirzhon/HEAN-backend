@@ -253,7 +253,7 @@ class NewsSentiment:
             for source in self.news_sources:
                 try:
                     # Parse RSS feed
-                    feed = await asyncio.get_event_loop().run_in_executor(
+                    feed = await asyncio.get_running_loop().run_in_executor(
                         None, feedparser.parse, source["rss"]
                     )
 

@@ -23,6 +23,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from hean.config import settings
+
 from hean.core.bus import EventBus
 from hean.core.types import Event, EventType
 from hean.logging import get_logger
@@ -36,6 +38,36 @@ from hean.physics.temperature import MarketTemperature
 from hean.physics.temporal_stack import TemporalStack
 
 logger = get_logger(__name__)
+
+
+class RollingNormalizer:
+    """Z-score normalizer with fixed window, output clamped and remapped to [0, 1].
+
+    Uses pure Python — no numpy dependency.  Each per-symbol instance maintains its
+    own rolling buffer so normalisation is automatically cross-symbol independent.
+    """
+
+    def __init__(self, window: int = 1000) -> None:
+        self._buf: deque[float] = deque(maxlen=window)
+
+    def normalize(self, x: float) -> float:
+        """Compute normalised value for x relative to the rolling window.
+
+        Returns 0.5 (neutral) until at least 10 samples have been collected.
+        Output is in [0.0, 1.0] — z-score clamped to [-3, 3] then remapped.
+        """
+        self._buf.append(x)
+        if len(self._buf) < 10:
+            return 0.5  # Not enough data — return neutral
+        arr = list(self._buf)
+        mean = sum(arr) / len(arr)
+        variance = sum((v - mean) ** 2 for v in arr) / len(arr)
+        std = variance ** 0.5
+        if std < 1e-10:
+            return 0.5
+        z = (x - mean) / std
+        z_clamped = max(-3.0, min(3.0, z))
+        return (z_clamped + 3.0) / 6.0  # Remap [-3, 3] → [0, 1]
 
 
 @dataclass
@@ -66,6 +98,11 @@ class PhysicsState:
     resonance_strength: float = 0.0      # 0-1 vector alignment score
     is_resonant: bool = False            # True when market vectors align
     causal_weight: float = 1.0           # Data collapse factor (0.05 in Laplace, 1.0 normal)
+    # Normalized values (per-symbol rolling z-score, output in [0, 1])
+    temperature_normalized: float = 0.5   # z-score normalized temperature
+    entropy_normalized: float = 0.5       # z-score normalized entropy
+    # Phase change flag (True when phase changed from previous tick)
+    phase_changed: bool = False
     # Anomaly detection
     anomalies: list[dict] = field(default_factory=list)
     # Cross-market impulse propagation
@@ -100,6 +137,11 @@ class PhysicsState:
             "resonance_strength": self.resonance_strength,
             "is_resonant": self.is_resonant,
             "causal_weight": self.causal_weight,
+            # Normalized values (per-symbol rolling z-score, [0, 1])
+            "temperature_normalized": self.temperature_normalized,
+            "entropy_normalized": self.entropy_normalized,
+            # Phase change flag
+            "phase_changed": self.phase_changed,
             # Extended fields
             "anomalies": self.anomalies,
             "cross_market_impulse": self.cross_market_impulse,
@@ -153,6 +195,13 @@ class PhysicsEngine:
 
         # Current state cache
         self._states: dict[str, PhysicsState] = {}
+
+        # Per-symbol rolling normalizers for temperature and entropy
+        self._temp_normalizers: dict[str, RollingNormalizer] = {}
+        self._entropy_normalizers: dict[str, RollingNormalizer] = {}
+
+        # Throttle: last publish timestamp per symbol (ms)
+        self._last_physics_publish: dict[str, float] = {}
 
         self._running = False
 
@@ -240,6 +289,10 @@ class PhysicsEngine:
 
         # ── 2. Entropy (Shannon + SSD entropy flow) ───────────────────────────
         entropy_reading = self._entropy.calculate(volumes, symbol)
+
+        # ── 2a. Capture previous phase before detection (for throttle & flag) ─
+        prev_reading = self._phase_detector.get_current(symbol)
+        prev_phase: str | None = prev_reading.phase.value if prev_reading else None
 
         # ── 3. Phase detection with SSD (Kalman, resonance, WATER sub-phases) ─
         self._phase_detector.update_market_vectors(
@@ -349,7 +402,23 @@ class PhysicsEngine:
 
         self._prev_prices[symbol] = price
 
-        # ── 13. Build enriched state ───────────────────────────────────────────
+        # ── 13. Per-symbol rolling normalizers (lazy init) ────────────────────
+        if symbol not in self._temp_normalizers:
+            self._temp_normalizers[symbol] = RollingNormalizer(
+                window=settings.physics_temperature_normalize_window
+            )
+            self._entropy_normalizers[symbol] = RollingNormalizer(
+                window=settings.physics_entropy_normalize_window
+            )
+
+        temperature_normalized = self._temp_normalizers[symbol].normalize(temp_reading.value)
+        entropy_normalized = self._entropy_normalizers[symbol].normalize(entropy_reading.value)
+
+        # ── 13a. Determine whether phase changed from previous tick ────────────
+        current_phase_str = phase.value
+        phase_changed = (prev_phase != current_phase_str) if prev_phase is not None else True
+
+        # ── 14. Build enriched state ───────────────────────────────────────────
         state = PhysicsState(
             symbol=symbol,
             temperature=temp_reading.value,
@@ -360,7 +429,7 @@ class PhysicsEngine:
             temp_is_spike=temp_reading.is_spike,
             entropy=entropy_reading.value,
             entropy_state=entropy_reading.state,
-            phase=phase.value,
+            phase=current_phase_str,
             phase_confidence=phase_confidence,
             szilard_profit=szilard.max_profit,
             should_trade=should_trade,
@@ -372,6 +441,9 @@ class PhysicsEngine:
             resonance_strength=resonance.strength,
             is_resonant=resonance.is_resonant,
             causal_weight=causal_weight,
+            temperature_normalized=temperature_normalized,
+            entropy_normalized=entropy_normalized,
+            phase_changed=phase_changed,
             anomalies=anomaly_dicts,
             cross_market_impulse=cross_impulse_dict,
             temporal_signal=temporal_signal,
@@ -380,7 +452,18 @@ class PhysicsEngine:
 
         self._states[symbol] = state
 
-        # ── 14. Publish enriched PHYSICS_UPDATE ───────────────────────────────
+        # ── 15. Throttle PHYSICS_UPDATE publishes ─────────────────────────────
+        # Always publish on phase change; otherwise enforce minimum interval.
+        now_ms = time.time() * 1000
+        last_pub = self._last_physics_publish.get(symbol, 0.0)
+        min_interval = settings.physics_publish_min_interval_ms
+
+        if not phase_changed and (now_ms - last_pub) < min_interval:
+            return  # Skip this publish cycle — consumer doesn't need sub-interval updates
+
+        self._last_physics_publish[symbol] = now_ms
+
+        # ── 16. Publish enriched PHYSICS_UPDATE ───────────────────────────────
         await self._bus.publish(
             Event(
                 event_type=EventType.PHYSICS_UPDATE,

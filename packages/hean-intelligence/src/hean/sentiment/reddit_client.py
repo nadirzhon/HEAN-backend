@@ -177,7 +177,7 @@ class RedditSentiment:
         cutoff_time = datetime.utcnow() - timedelta(hours=hours)
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             # Search across multiple subreddits
             for subreddit_name in self.subreddits:
@@ -278,7 +278,7 @@ class RedditSentiment:
 
         try:
             topics = []
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             for subreddit_name in self.subreddits[:3]:  # Top 3 subreddits
                 try:

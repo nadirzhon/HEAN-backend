@@ -103,7 +103,7 @@ class MarketDataLoader:
                 # Run synchronous pybit call in executor to avoid blocking
                 # Capture loop variables to avoid late binding issue
                 _current_start = current_start
-                result = await asyncio.get_event_loop().run_in_executor(
+                result = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda cs=_current_start: self.client.get_kline(
                         category="linear",
@@ -200,7 +200,7 @@ class MarketDataLoader:
             end_ts = int(end_date.timestamp() * 1000)
 
             # Run in executor
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: self.client.get_funding_rate_history(
                     category="linear",

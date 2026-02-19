@@ -134,37 +134,109 @@ class MarketAnomalyDetector:
         detected: list[MarketAnomaly] = []
 
         # --- 1. VOLUME_ANOMALY ---
-        vol_anomaly = self._check_volume_anomaly(symbol, volume, now)
-        if vol_anomaly:
-            detected.append(vol_anomaly)
+        try:
+            vol_anomaly = self._check_volume_anomaly(symbol, volume, now)
+            if vol_anomaly:
+                detected.append(vol_anomaly)
+        except Exception as e:
+            logger.error(f"AnomalyDetector [volume_anomaly] failed: {e}", exc_info=True)
+            detected.append(MarketAnomaly(
+                id=self._next_id(),
+                anomaly_type=AnomalyType.VOLUME_ANOMALY,
+                severity=0.0,
+                description=f"Detector error: volume_anomaly on {symbol}",
+                symbol=symbol,
+                timestamp=now,
+                details={"type": "detector_error", "subtype": "volume_anomaly", "error": str(e)},
+            ))
 
         # --- 2. PRICE_DISLOCATION ---
-        price_anomaly = self._check_price_dislocation(symbol, price, now)
-        if price_anomaly:
-            detected.append(price_anomaly)
+        try:
+            price_anomaly = self._check_price_dislocation(symbol, price, now)
+            if price_anomaly:
+                detected.append(price_anomaly)
+        except Exception as e:
+            logger.error(f"AnomalyDetector [price_dislocation] failed: {e}", exc_info=True)
+            detected.append(MarketAnomaly(
+                id=self._next_id(),
+                anomaly_type=AnomalyType.PRICE_DISLOCATION,
+                severity=0.0,
+                description=f"Detector error: price_dislocation on {symbol}",
+                symbol=symbol,
+                timestamp=now,
+                details={"type": "detector_error", "subtype": "price_dislocation", "error": str(e)},
+            ))
 
         # --- 3. WHALE_INFLOW ---
-        whale_anomaly = self._check_whale_inflow(symbol, volume, now)
-        if whale_anomaly:
-            detected.append(whale_anomaly)
+        try:
+            whale_anomaly = self._check_whale_inflow(symbol, volume, now)
+            if whale_anomaly:
+                detected.append(whale_anomaly)
+        except Exception as e:
+            logger.error(f"AnomalyDetector [whale_inflow] failed: {e}", exc_info=True)
+            detected.append(MarketAnomaly(
+                id=self._next_id(),
+                anomaly_type=AnomalyType.WHALE_INFLOW,
+                severity=0.0,
+                description=f"Detector error: whale_inflow on {symbol}",
+                symbol=symbol,
+                timestamp=now,
+                details={"type": "detector_error", "subtype": "whale_inflow", "error": str(e)},
+            ))
 
         # --- 4. LIQUIDATION_CASCADE ---
         if side:
-            cascade_anomaly = self._check_liquidation_cascade(symbol, volume, side, now)
-            if cascade_anomaly:
-                detected.append(cascade_anomaly)
+            try:
+                cascade_anomaly = self._check_liquidation_cascade(symbol, volume, side, now)
+                if cascade_anomaly:
+                    detected.append(cascade_anomaly)
+            except Exception as e:
+                logger.error(f"AnomalyDetector [liquidation_cascade] failed: {e}", exc_info=True)
+                detected.append(MarketAnomaly(
+                    id=self._next_id(),
+                    anomaly_type=AnomalyType.LIQUIDATION_CASCADE,
+                    severity=0.0,
+                    description=f"Detector error: liquidation_cascade on {symbol}",
+                    symbol=symbol,
+                    timestamp=now,
+                    details={"type": "detector_error", "subtype": "liquidation_cascade", "error": str(e)},
+                ))
 
         # --- 5. FUNDING_DIVERGENCE ---
         if funding_rate is not None:
-            funding_anomaly = self._check_funding_divergence(symbol, funding_rate, now)
-            if funding_anomaly:
-                detected.append(funding_anomaly)
+            try:
+                funding_anomaly = self._check_funding_divergence(symbol, funding_rate, now)
+                if funding_anomaly:
+                    detected.append(funding_anomaly)
+            except Exception as e:
+                logger.error(f"AnomalyDetector [funding_divergence] failed: {e}", exc_info=True)
+                detected.append(MarketAnomaly(
+                    id=self._next_id(),
+                    anomaly_type=AnomalyType.FUNDING_DIVERGENCE,
+                    severity=0.0,
+                    description=f"Detector error: funding_divergence on {symbol}",
+                    symbol=symbol,
+                    timestamp=now,
+                    details={"type": "detector_error", "subtype": "funding_divergence", "error": str(e)},
+                ))
 
         # --- 6. OI_SPIKE ---
         if oi is not None:
-            oi_anomaly = self._check_oi_spike(symbol, oi, now)
-            if oi_anomaly:
-                detected.append(oi_anomaly)
+            try:
+                oi_anomaly = self._check_oi_spike(symbol, oi, now)
+                if oi_anomaly:
+                    detected.append(oi_anomaly)
+            except Exception as e:
+                logger.error(f"AnomalyDetector [oi_spike] failed: {e}", exc_info=True)
+                detected.append(MarketAnomaly(
+                    id=self._next_id(),
+                    anomaly_type=AnomalyType.OI_SPIKE,
+                    severity=0.0,
+                    description=f"Detector error: oi_spike on {symbol}",
+                    symbol=symbol,
+                    timestamp=now,
+                    details={"type": "detector_error", "subtype": "oi_spike", "error": str(e)},
+                ))
 
         # Update history after checks
         self._volume_history[symbol].append(volume)

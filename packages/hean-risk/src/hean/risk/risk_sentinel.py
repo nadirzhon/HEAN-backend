@@ -111,7 +111,27 @@ class RiskSentinel:
         self._stop_trading_flag = flag_ref
 
     async def start(self) -> None:
-        """Start sentinel — subscribe to state-changing events."""
+        """Start sentinel — subscribe to state-changing events.
+
+        The initial envelope is COMPUTED and CACHED here (so get_envelope()
+        returns a non-None value immediately) but NOT PUBLISHED as an event.
+        Event publication is deferred to ``publish_initial_envelope()``, which
+        must be called AFTER all strategies have subscribed to RISK_ENVELOPE.
+
+        Startup race that deferring publication avoids:
+          1. RiskSentinel.start() called at main.py:856
+          2. Strategies start() called at main.py:949–1050  ← subscribe here
+          3. If we published the event in step 1, strategies would miss it
+             because they haven't subscribed yet (RISK_ENVELOPE is not on
+             the fast-path; it enters the NORMAL queue which only drains
+             once the current coroutine chain yields).  Strategies would
+             start with _risk_envelope=None — no risk limits applied on
+             their first signals.
+
+        The two-phase approach:
+          - start(): compute → cache (get_envelope() usable immediately)
+          - publish_initial_envelope(): publish cached envelope as event
+        """
         self._running = True
 
         # Subscribe to events that change risk state
@@ -122,13 +142,44 @@ class RiskSentinel:
         self._bus.subscribe(EventType.ORDER_CANCELLED, self._on_position_change)
         self._bus.subscribe(EventType.KILLSWITCH_TRIGGERED, self._on_position_change)
         self._bus.subscribe(EventType.KILLSWITCH_RESET, self._on_position_change)
-        # Fix: subscribe to STOP_TRADING so _stop_trading flag updates reliably
+        # Subscribe to STOP_TRADING so _stop_trading flag updates reliably.
         # (passing a bool to __init__ copies it by value — Python bool is immutable)
         self._bus.subscribe(EventType.STOP_TRADING, self._on_stop_trading)
 
-        # Compute initial envelope
+        # Compute and CACHE the initial envelope now (makes get_envelope() non-None
+        # immediately) but do NOT publish the event yet — strategies haven't
+        # subscribed yet.  Call publish_initial_envelope() from TradingSystem
+        # after all Strategy.start() calls complete.
+        try:
+            envelope = self._compute_envelope()
+            self._cached_envelope = envelope
+            self._last_compute = time.monotonic()
+            logger.info(
+                "RiskSentinel started: initial envelope cached "
+                "(trading_allowed=%s, state=%s) — publish deferred",
+                envelope.trading_allowed,
+                envelope.risk_state,
+            )
+        except Exception as e:
+            logger.error("RiskSentinel: initial envelope computation failed: %s", e)
+
+    async def publish_initial_envelope(self) -> None:
+        """Publish the initial risk envelope to all strategy subscribers.
+
+        Call this from TradingSystem AFTER all strategies have called start()
+        and subscribed to RISK_ENVELOPE events.  Ensures every strategy
+        receives the initial envelope and starts with a non-None _risk_envelope
+        before the first TICK arrives.
+
+        This is the second phase of the two-phase startup (see start() docstring).
+        """
+        if not self._running:
+            logger.warning("publish_initial_envelope() called but sentinel is not running")
+            return
+        # Re-compute so the published envelope reflects any state changes that
+        # occurred between start() and now (e.g. strategies updated allocations).
         await self._recompute_and_publish()
-        logger.info("RiskSentinel started")
+        logger.info("RiskSentinel: initial envelope published to %d strategy subscribers", 1)
 
     async def stop(self) -> None:
         """Stop sentinel — unsubscribe from events."""

@@ -65,8 +65,11 @@ class SentimentAnalyzer:
         try:
             logger.info(f"Loading sentiment model: {self.model_name}")
 
-            # Load in thread pool to not block event loop
-            loop = asyncio.get_event_loop()
+            # Load in thread pool to not block event loop.
+            # get_running_loop() is correct here — initialize() is always awaited inside
+            # an already-running event loop. get_event_loop() is deprecated in 3.10+ and
+            # raises RuntimeError in 3.12+ when invoked from within a running loop.
+            loop = asyncio.get_running_loop()
             self._pipeline = await loop.run_in_executor(
                 None,
                 lambda: pipeline(
@@ -114,8 +117,8 @@ class SentimentAnalyzer:
                 logger.debug("Text too short to analyze")
                 return None
 
-            # Analyze in thread pool
-            loop = asyncio.get_event_loop()
+            # Analyze in thread pool (always awaited inside a running loop).
+            loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
                 lambda: self._pipeline(text[:512])[0]  # Max 512 tokens

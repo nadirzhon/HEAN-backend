@@ -166,3 +166,18 @@ class RegimeFeatures:
             'volume_spike_ratio': self.volume_spike_ratio,
             'spread_spike_ratio': self.spread_spike_ratio,
         }
+
+
+# Physics phase → Island regime mapping (for Symbiont X Island Model).
+# Used by IslandModel.get_island_for_phase() and evolve_island_for_phase()
+# to route regime-conditional selection to the most relevant sub-population.
+PHYSICS_PHASE_TO_ISLAND_REGIME: dict[str, str] = {
+    "markup": "trending",        # Upward price discovery → trending island
+    "accumulation": "ranging",   # Consolidation before breakout → ranging island
+    "distribution": "volatile",  # Top formation with high noise → volatile island
+    "markdown": "volatile",      # Downward price discovery → volatile island
+    "vapor": "volatile",         # Extremely thin / illiquid → volatile island
+    "ice": "ranging",            # Frozen / low-vol sideways → ranging island
+    "unknown": "mixed",          # No clear classification → mixed island
+    "water": "trending",         # Liquid normal market → treat as trending island
+}

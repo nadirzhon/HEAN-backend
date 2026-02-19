@@ -4,7 +4,8 @@ HEAN SYMBIONT X
 Самоэволюционирующий организм для автономной торговли
 """
 
+from .bridge import SovereignSymbiont, SymbiontXBridge
 from .symbiont import HEANSymbiontX
 
 __version__ = "0.1.0"
-__all__ = ['HEANSymbiontX']
+__all__ = ['HEANSymbiontX', 'SovereignSymbiont', 'SymbiontXBridge']

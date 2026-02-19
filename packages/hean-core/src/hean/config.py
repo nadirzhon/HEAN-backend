@@ -1257,6 +1257,49 @@ class HEANSettings(BaseSettings):
         description="Seconds between optimization cycles (default 3600 = 1 hour)",
     )
 
+    # Phase 3: SovereignSymbiont — full evolutionary bridge
+    symbiont_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable SovereignSymbiont full evolutionary bridge "
+            "(EvolutionEngine + immune gate + live STRATEGY_PARAMS_UPDATED). "
+            "Distinct from symbiont_x_enabled (simpler GA bridge)."
+        ),
+    )
+    symbiont_evolution_interval: int = Field(
+        default=300,
+        gt=30,
+        description="Seconds between SovereignSymbiont evolution cycles (default 300 = 5 min)",
+    )
+    symbiont_population_size: int = Field(
+        default=50,
+        gt=0,
+        description="Population size for SovereignSymbiont EvolutionEngine (default 50)",
+    )
+    symbiont_elite_size: int = Field(
+        default=5,
+        gt=0,
+        description="Elite size preserved unchanged per generation (default 5)",
+    )
+    symbiont_min_wfa_efficiency: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum Walk-Forward Efficiency ratio for genome promotion. "
+            "Genomes below this threshold are never promoted to live strategies."
+        ),
+    )
+    symbiont_min_promotion_fitness: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum composite fitness score for genome promotion "
+            "(weighted blend of wfa, calmar, omega, sortino — all normalised to [0,1])."
+        ),
+    )
+
     # ARCHON Brain-Orchestrator
     archon_enabled: bool = Field(default=True, description="Enable ARCHON orchestrator")
     archon_signal_pipeline_enabled: bool = Field(
