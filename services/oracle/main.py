@@ -143,18 +143,18 @@ def _score_reversion(temperatures: deque) -> tuple[float, str]:
     arr = np.array(list(temperatures), dtype=np.float64)
     mean = float(arr.mean())
     std = float(arr.std()) + 1e-10
-    current = arr[-1]
+    current = float(arr[-1])
 
     z = (current - mean) / std
 
     if z > REVERSION_ZSCORE_THRESHOLD:
         # Overheated — expect reversal downward
         confidence = min(0.40 + 0.20 * (z - REVERSION_ZSCORE_THRESHOLD), 0.85)
-        return round(confidence, 4), "SELL"
+        return float(round(confidence, 4)), "SELL"
     elif z < -REVERSION_ZSCORE_THRESHOLD:
         # Undercooled — expect reversal upward
         confidence = min(0.40 + 0.20 * (-z - REVERSION_ZSCORE_THRESHOLD), 0.85)
-        return round(confidence, 4), "BUY"
+        return float(round(confidence, 4)), "BUY"
 
     return 0.30, "HOLD"
 
@@ -192,7 +192,7 @@ def _fuse_signals(
     else:
         action = "HOLD"
 
-    return round(combined_score, 4), action
+    return float(round(combined_score, 4)), action
 
 
 # ── OracleService ─────────────────────────────────────────────────────────────
@@ -274,9 +274,9 @@ class OracleService:
             return
         self.last_fusion_ts[symbol] = now
 
-        price = physics.get("price", 0.0)
-        temperature = physics.get("temperature", 0.0)
-        entropy = physics.get("entropy", 0.0)
+        price = float(physics.get("price", 0.0))
+        temperature = float(physics.get("temperature", 0.0))
+        entropy = float(physics.get("entropy", 0.0))
         phase = physics.get("phase", "UNKNOWN")
 
         # ── Source 1: Physics ─────────────────────────────────────────────────
@@ -309,15 +309,16 @@ class OracleService:
         )
 
         # Always publish raw predictions for observability
+        # Ensure all numeric values are native Python types for orjson serialization
         prediction = {
             "symbol": symbol,
             "action": action,
-            "combined_score": combined_score,
+            "combined_score": float(combined_score),
             "sources": {
-                "physics": {"confidence": phys_conf, "direction": phys_dir},
-                "brain":   {"confidence": brain_conf, "direction": brain_dir},
-                "momentum": {"confidence": mom_conf, "direction": mom_dir},
-                "reversion": {"confidence": rev_conf, "direction": rev_dir},
+                "physics": {"confidence": float(phys_conf), "direction": phys_dir},
+                "brain":   {"confidence": float(brain_conf), "direction": brain_dir},
+                "momentum": {"confidence": float(mom_conf), "direction": mom_dir},
+                "reversion": {"confidence": float(rev_conf), "direction": rev_dir},
             },
             "price": price,
             "temperature": temperature,
@@ -332,14 +333,14 @@ class OracleService:
             oracle_signal = {
                 "symbol": symbol,
                 "action": action,
-                "confidence": combined_score,
+                "confidence": float(combined_score),
                 "sources": {
-                    "physics": phys_conf,
-                    "brain": brain_conf,
-                    "momentum": mom_conf,
-                    "reversion": rev_conf,
+                    "physics": float(phys_conf),
+                    "brain": float(brain_conf),
+                    "momentum": float(mom_conf),
+                    "reversion": float(rev_conf),
                 },
-                "combined_score": combined_score,
+                "combined_score": float(combined_score),
                 "timestamp": int(now * 1000),
                 "price": price,
                 "phase": phase,

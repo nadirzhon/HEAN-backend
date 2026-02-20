@@ -1,6 +1,6 @@
 """Multi-symbol scanner for AFO-Director feature."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from hean.config import settings
@@ -56,7 +56,7 @@ class MultiSymbolScanner:
         Returns:
             Dictionary with market_regime, market_metrics_short, last_tick_age_sec
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         # Get last tick age
         last_tick_age_sec = None
@@ -95,7 +95,7 @@ class MultiSymbolScanner:
     async def handle_tick(self, event: Event) -> None:
         """Handle tick event to update last_tick_at."""
         tick: Tick = event.data["tick"]
-        self._last_tick_at[tick.symbol] = datetime.utcnow()
+        self._last_tick_at[tick.symbol] = datetime.now(timezone.utc)
 
         # Update last price
         if tick.price:

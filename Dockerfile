@@ -43,6 +43,7 @@ RUN mkdir -p /app/data /app/logs
 # PYTHONPATH: all workspace package src dirs for namespace resolution
 ENV PYTHONPATH="/app/packages/hean-core/src:/app/packages/hean-exchange/src:/app/packages/hean-portfolio/src:/app/packages/hean-risk/src:/app/packages/hean-execution/src:/app/packages/hean-strategies/src:/app/packages/hean-physics/src:/app/packages/hean-intelligence/src:/app/packages/hean-observability/src:/app/packages/hean-symbiont/src:/app/packages/hean-api/src:/app/packages/hean-app/src"
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
 # CRITICAL: workers=1 — TradingSystem uses in-process shared state (EventBus, accounting,
 # killswitch). Multiple workers would create independent TradingSystem instances (split-brain):

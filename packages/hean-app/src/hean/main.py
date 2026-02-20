@@ -254,7 +254,7 @@ class TradingSystem:
         # Check for stale data
         last_tick_age_sec = None
         if hasattr(self, "_last_tick_at") and signal.symbol in self._last_tick_at:
-            last_tick_age_sec = (datetime.utcnow() - self._last_tick_at[signal.symbol]).total_seconds()
+            last_tick_age_sec = (datetime.now(timezone.utc) - self._last_tick_at[signal.symbol]).total_seconds()
             if last_tick_age_sec > 30:
                 market_regime = "STALE_DATA"
                 reason_codes.append("STALE_MARKET_DATA")
@@ -2649,7 +2649,7 @@ class TradingSystem:
                 data={
                     "order": order,
                     "fill_price": fill_price,
-                    "fill_size": event.data.get("fill_size", order.qty),
+                    "fill_size": event.data.get("fill_size", order.filled_size or order.size),
                     "fee": fee,
                     "symbol": order.symbol,
                     "side": order.side,
@@ -3264,7 +3264,7 @@ class TradingSystem:
         """Mark-to-market on every tick and evaluate exit plans/TTL."""
         tick = event.data["tick"]
         symbol = tick.symbol
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         self._last_tick_at[symbol] = now
 
         # Fabric: register DNA root for this TICK and cache per-symbol
@@ -3440,7 +3440,7 @@ class TradingSystem:
         if not self._running:
             return
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         positions = list(self._accounting.get_positions())
         for position in positions:
             last_tick = self._last_tick_at.get(position.symbol)

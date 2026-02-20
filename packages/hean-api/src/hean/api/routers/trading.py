@@ -1,7 +1,7 @@
 """Trading operations router."""
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from slowapi import Limiter
@@ -446,7 +446,7 @@ async def why_not_trading(request: Request) -> dict:
             all_decisions = list(api_main.trading_state_cache.get("order_decisions", []))
 
         # Filter decisions from last 5 minutes
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         five_min_ago = now - timedelta(minutes=5)
         recent_decisions = []
         for decision in all_decisions:
