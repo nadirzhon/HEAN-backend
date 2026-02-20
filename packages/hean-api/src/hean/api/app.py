@@ -9,12 +9,22 @@ from fastapi.responses import JSONResponse
 
 from hean.api.engine_facade import EngineFacade
 from hean.api.reconcile import ReconcileService
-from hean.api.routers import analytics, engine, risk, strategies, system, telemetry, trading
+from hean.api.routers import (
+    analytics,
+    engine,
+    logs_intelligence,
+    risk,
+    strategies,
+    system,
+    telemetry,
+    trading,
+)
 from hean.api.services.event_stream import event_stream_service
 from hean.api.services.log_stream import log_stream_service
 from hean.config import settings
 from hean.exchange.bybit.http import BybitHTTPClient
 from hean.logging import get_logger
+from hean.observability.log_intelligence import log_intelligence
 from hean.observability.metrics import metrics
 
 logger = get_logger(__name__)
@@ -44,10 +54,21 @@ async def lifespan(app: FastAPI):
     # Setup log stream
     log_stream_service.setup()
 
+    if settings.log_intelligence_enabled:
+        log_intelligence.configure_limits(
+            max_events=settings.log_intelligence_max_events,
+            max_incidents=settings.log_intelligence_max_incidents,
+        )
+        if settings.log_intelligence_capture_backend_logs:
+            log_intelligence.enable_backend_capture(
+                min_level=settings.log_intelligence_backend_min_level
+            )
+
     yield
 
     # Cleanup
     await event_stream_service.stop()
+    log_intelligence.disable_backend_capture()
     if state.engine_facade and state.engine_facade.is_running:
         await state.engine_facade.stop()
 
@@ -89,6 +110,7 @@ app.include_router(strategies.router)
 app.include_router(risk.router)
 app.include_router(analytics.router)
 app.include_router(system.router)
+app.include_router(logs_intelligence.router)
 app.include_router(telemetry.router)
 
 

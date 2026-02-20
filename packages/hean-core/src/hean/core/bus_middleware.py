@@ -230,12 +230,13 @@ class MiddlewarePipeline:
 # verifies key presence, not type or value, to keep the hot-path overhead
 # minimal.
 _REQUIRED_KEYS: dict[EventType, frozenset[str]] = {
-    EventType.TICK: frozenset({"symbol", "price"}),
-    EventType.SIGNAL: frozenset({"symbol", "side", "strategy_id"}),
-    EventType.ORDER_REQUEST: frozenset({"symbol", "side", "qty"}),
-    EventType.ORDER_FILLED: frozenset({"symbol", "side", "qty", "price"}),
-    EventType.POSITION_OPENED: frozenset({"symbol", "side", "size", "entry_price"}),
-    EventType.POSITION_CLOSED: frozenset({"symbol", "pnl"}),
+    # Events are wrapped in named keys: data={"tick": tick_obj}, data={"signal": signal_obj}, etc.
+    EventType.TICK: frozenset({"tick"}),
+    EventType.SIGNAL: frozenset({"signal"}),
+    EventType.ORDER_REQUEST: frozenset({"order_request"}),
+    EventType.ORDER_FILLED: frozenset({"order", "symbol", "side"}),
+    EventType.POSITION_OPENED: frozenset({"position"}),
+    EventType.POSITION_CLOSED: frozenset({"position"}),
     EventType.RISK_ALERT: frozenset({"reason"}),
 }
 

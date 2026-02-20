@@ -11,7 +11,7 @@ Unified MarketContext — центральное хранилище состоя
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from hean.core.regime import Regime
@@ -130,7 +130,12 @@ class UnifiedMarketContext:
         """Данные свежие (тик < 5 секунд назад)?"""
         if self.last_tick_at is None:
             return False
-        return (datetime.utcnow() - self.last_tick_at).total_seconds() < 5
+        now_utc = datetime.now(timezone.utc)
+        last = self.last_tick_at
+        # Normalize: make last timezone-aware if it isn't (Bybit may return aware datetimes)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        return (now_utc - last).total_seconds() < 5
 
     @property
     def overall_signal_strength(self) -> float:

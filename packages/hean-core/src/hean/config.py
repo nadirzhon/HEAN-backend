@@ -52,6 +52,10 @@ SAFE_RELOAD_KEYS: frozenset[str] = frozenset(
         "autopilot_max_active_strategies",
         "autopilot_exploration_bonus",
         "autopilot_config_cooldown_sec",
+        # Log intelligence
+        "log_intelligence_enabled",
+        "log_intelligence_capture_backend_logs",
+        "log_intelligence_backend_min_level",
     }
 )
 
@@ -872,6 +876,28 @@ class HEANSettings(BaseSettings):
             "or 'text' for human-readable console output (local development). "
             "Defaults to 'text'; set LOG_FORMAT=json in Docker/production environments."
         ),
+    )
+    log_intelligence_enabled: bool = Field(
+        default=True,
+        description="Enable unified log intelligence ingestion and incident aggregation APIs.",
+    )
+    log_intelligence_capture_backend_logs: bool = Field(
+        default=True,
+        description="Capture backend logger output into log intelligence service.",
+    )
+    log_intelligence_backend_min_level: str = Field(
+        default="WARNING",
+        description="Minimum backend log level captured by log intelligence handler.",
+    )
+    log_intelligence_max_events: int = Field(
+        default=5000,
+        ge=100,
+        description="Maximum in-memory log events retained by log intelligence service.",
+    )
+    log_intelligence_max_incidents: int = Field(
+        default=1000,
+        ge=10,
+        description="Maximum in-memory incident fingerprints retained by log intelligence service.",
     )
     health_check_port: int = Field(default=8080, gt=0, le=65535, description="Health check port")
     debug_mode: bool = Field(

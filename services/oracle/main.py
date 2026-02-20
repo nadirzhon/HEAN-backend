@@ -115,8 +115,8 @@ def _score_momentum(prices: deque) -> tuple[float, str]:
     x = np.arange(n, dtype=np.float64)
 
     # Linear regression slope via closed-form
-    x_mean = x.mean()
-    y_mean = arr.mean()
+    x_mean = float(x.mean())
+    y_mean = float(arr.mean())
     slope = float(np.dot(x - x_mean, arr - y_mean) / (np.dot(x - x_mean, x - x_mean) + 1e-10))
 
     # Normalise slope as % change per tick relative to mean price
@@ -127,7 +127,7 @@ def _score_momentum(prices: deque) -> tuple[float, str]:
     confidence = 0.3 + 0.5 * magnitude  # range [0.3, 0.8]
 
     direction = "BUY" if norm_slope > 0 else "SELL" if norm_slope < 0 else "HOLD"
-    return round(confidence, 4), direction
+    return float(round(confidence, 4)), direction
 
 
 def _score_reversion(temperatures: deque) -> tuple[float, str]:

@@ -34,6 +34,7 @@ from hean.core.bus import EventBus
 from hean.core.system.redis_state import get_redis_state_manager
 from hean.core.types import Event, EventType
 from hean.logging import get_logger
+from hean.observability.log_intelligence import log_intelligence
 from hean.risk.killswitch import KillSwitch
 
 logger = get_logger(__name__)
@@ -368,6 +369,25 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to bind engine facade into state: {e}", exc_info=True)
         raise
 
+    # Configure log intelligence (passive observability; never mutates trading decisions)
+    if settings.log_intelligence_enabled:
+        try:
+            log_intelligence.configure_limits(
+                max_events=settings.log_intelligence_max_events,
+                max_incidents=settings.log_intelligence_max_incidents,
+            )
+            if settings.log_intelligence_capture_backend_logs:
+                log_intelligence.enable_backend_capture(
+                    min_level=settings.log_intelligence_backend_min_level
+                )
+            logger.info("LOG_INTELLIGENCE_INIT_OK")
+        except Exception as log_intel_exc:
+            logger.warning(
+                "LOG_INTELLIGENCE_INIT_FAIL: %s (continuing without capture)",
+                log_intel_exc,
+                exc_info=True,
+            )
+
     # Initialize Redis state manager with retry logic
     redis_state_manager = None
     app.state.redis_state_manager = None
@@ -563,7 +583,13 @@ async def lifespan(app: FastAPI):
     if shutdown_tasks:
         await asyncio.gather(*shutdown_tasks, return_exceptions=True)
 
-    # 6. Flush OpenTelemetry spans before process exit
+    # 6. Detach optional log intelligence capture handler
+    try:
+        log_intelligence.disable_backend_capture()
+    except Exception as log_intel_shutdown_exc:
+        logger.warning("LOG_INTELLIGENCE_SHUTDOWN_FAIL: %s", log_intel_shutdown_exc)
+
+    # 7. Flush OpenTelemetry spans before process exit
     if _otel_active:
         try:
             from hean.observability.otel import shutdown_tracing
@@ -1487,6 +1513,7 @@ from hean.api.routers import (  # noqa: E402
     engine,
     experiments,
     graph_engine,
+    logs_intelligence,
     market,
     meta_brain,
     meta_learning,
@@ -1518,6 +1545,7 @@ app.include_router(risk_governor.router, prefix=API_PREFIX)
 app.include_router(analytics.router, prefix=API_PREFIX)
 app.include_router(system.router, prefix=API_PREFIX)
 app.include_router(graph_engine.router, prefix=API_PREFIX)
+app.include_router(logs_intelligence.router, prefix=API_PREFIX)
 app.include_router(telemetry.router, prefix=API_PREFIX)
 app.include_router(market.router, prefix=API_PREFIX)
 app.include_router(changelog.router, prefix=API_PREFIX)

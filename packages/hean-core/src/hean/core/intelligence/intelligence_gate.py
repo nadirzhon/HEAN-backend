@@ -133,8 +133,8 @@ class IntelligenceGate:
 
         # Oracle/TCN prediction
         if context.prediction:
-            signal.metadata["oracle_direction"] = context.prediction.direction
-            signal.metadata["oracle_confidence"] = context.prediction.confidence
+            signal.metadata["oracle_direction"] = context.prediction.tcn_direction
+            signal.metadata["oracle_confidence"] = context.prediction.tcn_confidence
 
         # Physics phase
         if context.physics:
@@ -195,9 +195,9 @@ class IntelligenceGate:
             )
 
         # Oracle high-confidence override (second rejection path)
-        if context.prediction and context.prediction.confidence > 0:
-            oracle_conf = context.prediction.confidence
-            oracle_dir = context.prediction.direction
+        if context.prediction and context.prediction.tcn_confidence > 0:
+            oracle_conf = context.prediction.tcn_confidence
+            oracle_dir = context.prediction.tcn_direction
             min_conf = getattr(settings, "intelligence_gate_min_oracle_confidence_for_reject", 0.7)
 
             if oracle_conf >= min_conf:

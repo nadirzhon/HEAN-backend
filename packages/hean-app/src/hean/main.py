@@ -6,7 +6,7 @@ import signal
 import sys
 import uuid
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from hean.agent_generation.capital_optimizer import CapitalOptimizer
