@@ -1478,6 +1478,7 @@ from hean.api.routers import (  # noqa: E402
     analytics,
     archon,
     auth_management,
+    autopilot,
     brain,
     causal_inference,
     changelog,
@@ -1505,6 +1506,7 @@ from hean.api.routers import (  # noqa: E402
 API_PREFIX = "/api/v1"
 
 app.include_router(archon.router, prefix=API_PREFIX)
+app.include_router(autopilot.router, prefix=API_PREFIX)
 app.include_router(auth_management.router, prefix=f"{API_PREFIX}/auth", tags=["auth"])
 app.include_router(config_router_module.router, prefix=API_PREFIX)
 app.include_router(engine.router, prefix=API_PREFIX)

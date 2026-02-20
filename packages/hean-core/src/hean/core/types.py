@@ -90,6 +90,10 @@ class EventType(str, Enum):
     RISK_ENVELOPE = "risk_envelope"          # Pre-computed risk budget from RiskSentinel
     ENRICHED_SIGNAL = "enriched_signal"      # Signal after IntelligenceGate enrichment
 
+    # AutoPilot events
+    AUTOPILOT_DECISION = "autopilot_decision"          # Meta-decision made
+    AUTOPILOT_STATE_CHANGE = "autopilot_state_change"  # Mode transition
+
 
 @dataclass
 class Event:
@@ -98,6 +102,17 @@ class Event:
     event_type: EventType
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     data: dict[str, Any] = field(default_factory=dict)
+    # ── Telemetry Spine lifecycle timestamps ────────────────────────────────
+    # Filled by EventBus at each phase (monotonic seconds, 0.0 = not yet set).
+    # Use these to pinpoint exactly where time is lost in the signal chain:
+    #   bus_published_at  → when publish() was called
+    #   bus_queued_at     → when the event entered a priority queue
+    #   bus_dispatched_at → when _dispatch() started calling handlers
+    # Fast-path events (SIGNAL, ORDER_REQUEST, ORDER_FILLED) skip the queue,
+    # so bus_queued_at stays 0.0 for them — that is intentional.
+    bus_published_at: float = field(default=0.0, repr=False, compare=False)
+    bus_queued_at: float = field(default=0.0, repr=False, compare=False)
+    bus_dispatched_at: float = field(default=0.0, repr=False, compare=False)
 
 
 class Tick(BaseModel):

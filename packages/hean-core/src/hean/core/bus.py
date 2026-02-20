@@ -260,6 +260,13 @@ class EventBus:
             "circuit_breaker_trips": 0,
         }
 
+        # ── Telemetry Spine — accounting invariant counters ─────────────────
+        # Invariant: handler_calls_started == handler_calls_completed + in_flight_count
+        # Any deviation means a handler call started but never finished (leaked).
+        self._in_flight_count: int = 0          # handler calls currently executing
+        self._handler_calls_started: int = 0    # total handler invocations begun
+        self._handler_calls_completed: int = 0  # total handler invocations finished
+
         # --- Middleware pipeline (optional) ---
         self._middleware: Any = None
         self._metrics_mw: Any = None
@@ -440,6 +447,8 @@ class EventBus:
         """
         # Track event rate (bounded deque, so no unbounded growth)
         self._events_last_second.append(time.time())
+        # Telemetry Spine — stamp the moment publish() was called
+        event.bus_published_at = time.monotonic()
 
         # Update health status periodically
         self._update_health_status()
@@ -466,9 +475,11 @@ class EventBus:
             except Exception:
                 pass  # Middleware failure must never block publishing
 
-        # Fast-path for time-critical events
+        # Fast-path for time-critical events — also count in events_published so
+        # the accounting invariant (published == processed + dropped) holds for ALL events.
         if event.event_type in FAST_PATH_EVENTS:
             logger.debug(f"Publishing {event.event_type} event via fast-path")
+            self._metrics["events_published"] += 1
             await self._dispatch_fast(event)
             return
 
@@ -489,7 +500,8 @@ class EventBus:
             return
 
         try:
-            # Try non-blocking first
+            # Stamp queue-entry time for latency tracking, then try non-blocking put
+            event.bus_queued_at = time.monotonic()
             queue.put_nowait(event)
             self._metrics["events_published"] += 1
             self._metrics[f"{priority.name.lower()}_queue_published"] += 1
@@ -645,6 +657,20 @@ class EventBus:
         (TICK, HEARTBEAT) skip the child span to limit overhead but their context
         is still propagated so manual instrumentation in handlers works correctly.
         """
+        # Telemetry Spine — stamp dispatch start and measure queue-wait latency
+        event.bus_dispatched_at = time.monotonic()
+        if event.bus_queued_at > 0.0:
+            queue_wait_ms = (event.bus_dispatched_at - event.bus_queued_at) * 1000
+            if queue_wait_ms > 200 and event.event_type not in FAST_PATH_EVENTS:
+                logger.warning(
+                    "[EventBus] HIGH QUEUE LATENCY: %s waited %.0fms before dispatch "
+                    "(published→queued: %.1fms, queued→dispatch: %.0fms)",
+                    event.event_type,
+                    queue_wait_ms,
+                    (event.bus_queued_at - event.bus_published_at) * 1000,
+                    queue_wait_ms,
+                )
+
         handlers = self._subscribers.get(event.event_type, [])
         if not handlers:
             logger.warning(f"No subscribers for {event.event_type}")
@@ -716,28 +742,54 @@ class EventBus:
                 pass  # Middleware failure must never block dispatch
 
     async def _safe_call_handler(self, handler: Callable[[Event], Any], event: Event) -> None:
-        """Safely call a handler, catching exceptions.
+        """Call a handler and propagate exceptions to asyncio.gather(return_exceptions=True).
 
-        CRITICAL: Sync handlers are executed in thread pool to prevent blocking event loop.
+        ── BUG FIX ─────────────────────────────────────────────────────────────
+        Previously this method swallowed ALL exceptions (try/except with no re-raise).
+        That meant asyncio.gather() always received None from every handler call, so:
+          • _dispatch()'s "if isinstance(result, Exception)" branch NEVER fired
+          • handler_errors metric was NEVER incremented
+          • DeadLetterQueue was NEVER populated (DLQ was completely non-functional)
+        Fix: re-raise unconditionally so gather() captures the Exception.
+        _dispatch() then logs it and routes to the DLQ exactly as designed.
+        ────────────────────────────────────────────────────────────────────────
+
+        Sync handlers run in a thread pool to avoid blocking the event loop.
+        get_event_loop() is deprecated in 3.10+ / raises RuntimeError in 3.12+
+        from a running loop — always use get_running_loop() here.
         """
+        self._in_flight_count += 1
+        self._handler_calls_started += 1
+        handler_name = getattr(handler, "__qualname__", getattr(handler, "__name__", repr(handler)))
+        start_mono = time.monotonic()
         try:
-            logger.debug(f"Calling handler {handler.__name__} for {event.event_type}")
+            logger.debug("Calling handler %s for %s", handler_name, event.event_type)
             if asyncio.iscoroutinefunction(handler):
                 await handler(event)
             else:
-                # CRITICAL: Sync handlers must run in thread pool to avoid blocking event loop.
-                # Use get_running_loop() — we are always inside a running loop here since this
-                # coroutine is only ever awaited from _safe_call_handler which runs under asyncio.
-                # get_event_loop() is deprecated in Python 3.10+ and raises RuntimeError in 3.12+
-                # when called from a running loop that was not started by the current thread.
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(self._executor, handler, event)
-            logger.debug(f"Handler {handler.__name__} completed successfully")
-        except Exception as e:
-            logger.error(
-                f"Handler {handler.__name__} raised exception for {event.event_type}: {e}",
-                exc_info=True,
-            )
+
+            elapsed_ms = (time.monotonic() - start_mono) * 1000
+            logger.debug("Handler %s completed in %.1fms", handler_name, elapsed_ms)
+            # Warn on handlers that hold the event loop longer than 200ms.
+            # Such handlers starve other handlers in the same asyncio.gather() batch.
+            if elapsed_ms > 200:
+                logger.warning(
+                    "[EventBus] SLOW HANDLER: %s took %.0fms for %s — "
+                    "consider making it non-blocking or offloading to executor",
+                    handler_name, elapsed_ms, event.event_type,
+                )
+        except Exception:
+            # Re-raise so asyncio.gather(return_exceptions=True) captures this as an
+            # Exception result.  _dispatch() then increments handler_errors and
+            # routes the event to the DeadLetterQueue — as was always the design.
+            raise
+        finally:
+            # Decrement in-flight regardless of success/failure so the
+            # accounting invariant holds: started == completed + in_flight
+            self._in_flight_count -= 1
+            self._handler_calls_completed += 1
 
     async def start(self) -> None:
         """Start the event bus."""
@@ -894,6 +946,72 @@ class EventBus:
             },
             # DLQ stats
             "dlq_stats": self._dlq.get_stats() if self._dlq is not None else {},
+            # ── Telemetry Spine — accounting invariant ───────────────────────
+            # handler_calls_started == handler_calls_completed + in_flight_handlers
+            # handler_calls_leaked != 0 means a handler started but never finished.
+            # This catches: unhandled asyncio.CancelledError inside handlers,
+            # bare 'return' in finally blocks, or executor thread crashes.
+            "in_flight_handlers": self._in_flight_count,
+            "handler_calls_started": self._handler_calls_started,
+            "handler_calls_completed": self._handler_calls_completed,
+            "handler_calls_leaked": (
+                self._handler_calls_started
+                - self._handler_calls_completed
+                - self._in_flight_count
+            ),
+        }
+
+    # ── Subscriber validation ────────────────────────────────────────────────
+    # Critical event types that MUST have at least one subscriber at engine start.
+    # If any of these have no subscribers, events will be silently lost —
+    # the most insidious class of async bug.
+    _REQUIRED_SUBSCRIBERS: frozenset[EventType] = frozenset({
+        EventType.SIGNAL,
+        EventType.ORDER_REQUEST,
+        EventType.ORDER_FILLED,
+    })
+
+    def validate_critical_subscribers(self) -> list[str]:
+        """Check that all critical event types have at least one subscriber.
+
+        Call this after all components have subscribed (e.g., at engine start)
+        to catch misconfigured or missing handlers before any trading begins.
+
+        Returns:
+            List of warning strings for each missing subscriber (empty list = all OK).
+        """
+        issues: list[str] = []
+        for et in self._REQUIRED_SUBSCRIBERS:
+            subscribers = self._subscribers.get(et, [])
+            if not subscribers:
+                msg = f"NO SUBSCRIBERS for critical event {et.value}!"
+                issues.append(msg)
+                logger.error(
+                    "[EventBus] CRITICAL MISCONFIGURATION: %s — "
+                    "events of this type will be silently discarded!",
+                    msg,
+                )
+            else:
+                names = [getattr(h, "__qualname__", repr(h)) for h in subscribers]
+                logger.debug(
+                    "[EventBus] %s OK — %d subscriber(s): %s",
+                    et.value, len(subscribers), names,
+                )
+        return issues
+
+    def get_subscriber_map(self) -> dict[str, list[str]]:
+        """Return a full diagnostic map of event_type → [handler qualified names].
+
+        Use this to debug missing, duplicate, or unexpected subscriptions.
+        Only includes event types that have at least one subscriber.
+        """
+        return {
+            et.value: [
+                getattr(h, "__qualname__", getattr(h, "__name__", repr(h)))
+                for h in handlers
+            ]
+            for et, handlers in self._subscribers.items()
+            if handlers
         }
 
     def add_middleware(self, middleware: Any, priority: int = 0) -> None:

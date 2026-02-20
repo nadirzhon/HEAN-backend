@@ -45,6 +45,13 @@ SAFE_RELOAD_KEYS: frozenset[str] = frozenset(
         # Bus infrastructure
         "enable_bus_middleware",
         "enable_handler_circuit_breaker",
+        # AutoPilot
+        "autopilot_enabled",
+        "autopilot_eval_interval_sec",
+        "autopilot_min_active_strategies",
+        "autopilot_max_active_strategies",
+        "autopilot_exploration_bonus",
+        "autopilot_config_cooldown_sec",
     }
 )
 
@@ -1391,6 +1398,47 @@ class HEANSettings(BaseSettings):
     )
     archon_chronicle_max_memory: int = Field(
         default=10000, description="Max in-memory chronicle entries"
+    )
+
+    # AutoPilot Coordinator — autonomous meta-brain
+    autopilot_enabled: bool = Field(
+        default=True,
+        description="Enable AutoPilot Coordinator for autonomous meta-optimization",
+    )
+    autopilot_learning_period_sec: int = Field(
+        default=3600,
+        gt=60,
+        description="Initial learning period in seconds before AutoPilot makes decisions (default 1h)",
+    )
+    autopilot_eval_interval_sec: int = Field(
+        default=30,
+        gt=5,
+        description="Seconds between AutoPilot evaluation cycles (default 30)",
+    )
+    autopilot_min_active_strategies: int = Field(
+        default=2,
+        ge=1,
+        description="Minimum strategies that must always be active (default 2)",
+    )
+    autopilot_max_active_strategies: int = Field(
+        default=8,
+        ge=1,
+        description="Maximum strategies allowed active simultaneously (default 8)",
+    )
+    autopilot_exploration_bonus: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=0.5,
+        description="Thompson Sampling exploration bonus for under-explored strategies (default 0.1)",
+    )
+    autopilot_config_cooldown_sec: int = Field(
+        default=60,
+        gt=10,
+        description="Minimum seconds between consecutive config changes (prevents flapping)",
+    )
+    autopilot_journal_db_path: str = Field(
+        default="data/autopilot_journal.duckdb",
+        description="Path to DuckDB journal file for AutoPilot decision audit trail",
     )
 
     # ------------------------------------------------------------------

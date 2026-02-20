@@ -157,6 +157,9 @@ class TradingSystem:
         # Trade Council 2.0 (real-time adversarial signal evaluation)
         self._trade_council = None
 
+        # AutoPilot Coordinator (meta-brain for autonomous self-improvement)
+        self._autopilot = None
+
         # Temporal Event Fabric (causal DNA + EEV scoring)
         self._fabric_registry: CausalRegistry | None = None
         self._fabric_eev: EEVScorer | None = None
@@ -1220,6 +1223,29 @@ class TradingSystem:
             except Exception as e:
                 logger.warning(f"Could not start Trade Council: {e}")
 
+        # AutoPilot Coordinator — meta-brain for autonomous self-improvement
+        if self._mode == "run" and getattr(settings, 'autopilot_enabled', False):
+            try:
+                from hean.core.autopilot.coordinator import AutoPilotCoordinator
+
+                self._autopilot = AutoPilotCoordinator(
+                    bus=self._bus,
+                    learning_period_sec=float(
+                        getattr(settings, 'autopilot_learning_period_sec', 3600)
+                    ),
+                    eval_interval_sec=float(
+                        getattr(settings, 'autopilot_eval_interval_sec', 30)
+                    ),
+                    journal_db_path=getattr(
+                        settings, 'autopilot_journal_db_path',
+                        'data/autopilot_journal.duckdb',
+                    ),
+                )
+                await self._autopilot.start()
+                logger.info("AutoPilot Coordinator started")
+            except Exception as e:
+                logger.warning(f"Could not start AutoPilot Coordinator: {e}")
+
         # Temporal Event Fabric — causal genome tracking + EEV priority
         if settings.fabric_enabled:
             self._fabric_registry = CausalRegistry(maxsize=20_000)
@@ -1278,6 +1304,10 @@ class TradingSystem:
         # Stop Trade Council
         if self._trade_council:
             await self._trade_council.stop()
+
+        # Stop AutoPilot Coordinator
+        if self._autopilot:
+            await self._autopilot.stop()
 
         # Stop improvement catalyst
         if self._improvement_catalyst:

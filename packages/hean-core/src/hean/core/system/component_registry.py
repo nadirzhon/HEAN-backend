@@ -584,6 +584,13 @@ class ComponentRegistry:
                 config_flag=None,
                 optional=True,
             ),
+            ComponentDef(
+                name="autopilot",
+                factory=_make_autopilot,
+                deps=["strategy_allocator", "oracle_weighting", "rl_risk_manager"],
+                config_flag="autopilot_enabled",
+                optional=True,
+            ),
         ]
 
         for defn in defaults:
@@ -879,6 +886,18 @@ def _make_strategy_allocator(bus: EventBus, **kwargs: Any) -> Any:
         rebalance_interval=300,
         min_allocation_pct=0.05,
         max_allocation_pct=0.40,
+    )
+
+
+def _make_autopilot(bus: EventBus, **kwargs: Any) -> Any:
+    """Factory for AutoPilotCoordinator."""
+    from hean.core.autopilot.coordinator import AutoPilotCoordinator
+
+    return AutoPilotCoordinator(
+        bus=bus,
+        learning_period_sec=float(settings.autopilot_learning_period_sec),
+        eval_interval_sec=float(settings.autopilot_eval_interval_sec),
+        journal_db_path=settings.autopilot_journal_db_path,
     )
 
 

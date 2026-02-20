@@ -47,6 +47,9 @@ class EngineFacade:
         self._council = None
         self._trade_council = None
 
+        # AutoPilot Coordinator
+        self._autopilot = None
+
     async def start(self) -> dict[str, Any]:
         """Start the trading engine.
 
@@ -98,6 +101,10 @@ class EngineFacade:
                 if hasattr(self._trading_system, '_trade_council'):
                     self._trade_council = self._trading_system._trade_council
 
+                # Expose AutoPilot Coordinator
+                if hasattr(self._trading_system, '_autopilot'):
+                    self._autopilot = self._trading_system._autopilot
+
                 self._running = True
                 self._state = "RUNNING"
                 telemetry_service.set_engine_state("RUNNING")
@@ -147,6 +154,7 @@ class EngineFacade:
                 self._duckdb_store = None
                 self._council = None
                 self._trade_council = None
+                self._autopilot = None
 
                 logger.info("Engine stopped successfully")
                 return {"status": "stopped", "message": "Engine stopped successfully"}
