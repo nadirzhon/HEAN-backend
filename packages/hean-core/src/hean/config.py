@@ -382,6 +382,16 @@ class HEANSettings(BaseSettings):
         description="List of trading symbols to monitor and trade (e.g., ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'])",
     )
 
+    # Cross-Market Impulse (physics correlation: leader → followers)
+    cross_market_leader: str = Field(
+        default="BTCUSDT",
+        description="Leader symbol for CrossMarketImpulse physics analysis (usually BTC).",
+    )
+    cross_market_followers: list[str] = Field(
+        default=["ETHUSDT", "SOLUSDT"],
+        description="Follower symbols for CrossMarketImpulse correlation tracking.",
+    )
+
     # Multi-Symbol Support (AFO-Director feature)
     multi_symbol_enabled: bool = Field(
         default=True,

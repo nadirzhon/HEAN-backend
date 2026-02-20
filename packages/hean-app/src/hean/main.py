@@ -555,8 +555,8 @@ class TradingSystem:
                 self._temporal_stack = TemporalStack(symbols=settings.trading_symbols)
 
                 self._cross_market = CrossMarketImpulse(
-                    leader_symbols=["BTCUSDT"],
-                    follower_symbols=["ETHUSDT", "SOLUSDT"],
+                    leader_symbols=[settings.cross_market_leader],
+                    follower_symbols=settings.cross_market_followers,
                 )
 
                 logger.info("Physics Engine started (Temperature/Entropy/Phase/Participants/Anomalies/TemporalStack)")

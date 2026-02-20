@@ -45,6 +45,7 @@ class EngineFacade:
 
         # AI Council
         self._council = None
+        self._trade_council = None
 
     async def start(self) -> dict[str, Any]:
         """Start the trading engine.
@@ -93,6 +94,10 @@ class EngineFacade:
                 if hasattr(self._trading_system, '_council'):
                     self._council = self._trading_system._council
 
+                # Expose Trade Council 2.0
+                if hasattr(self._trading_system, '_trade_council'):
+                    self._trade_council = self._trading_system._trade_council
+
                 self._running = True
                 self._state = "RUNNING"
                 telemetry_service.set_engine_state("RUNNING")
@@ -128,6 +133,20 @@ class EngineFacade:
                 self._running = False
                 self._state = "STOPPED"
                 telemetry_service.set_engine_state("STOPPED")
+
+                # Clear all component references to prevent stale access after stop
+                self._meta_learning_engine = None
+                self._causal_inference_engine = None
+                self._multimodal_swarm = None
+                self._physics_engine = None
+                self._participant_classifier = None
+                self._anomaly_detector = None
+                self._temporal_stack = None
+                self._cross_market = None
+                self._brain_client = None
+                self._duckdb_store = None
+                self._council = None
+                self._trade_council = None
 
                 logger.info("Engine stopped successfully")
                 return {"status": "stopped", "message": "Engine stopped successfully"}
