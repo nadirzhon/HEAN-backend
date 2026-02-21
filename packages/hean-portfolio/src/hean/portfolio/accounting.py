@@ -352,6 +352,57 @@ class PortfolioAccounting:
 
         return metrics
 
+    def get_overall_metrics(self) -> dict[str, float]:
+        """Get aggregated overall portfolio metrics.
+
+        Returns a dict with keys used by the analytics summary endpoint:
+            total_trades, wins, losses, gross_profit, gross_loss,
+            total_pnl, daily_pnl, max_drawdown, max_drawdown_pct,
+            avg_trade_duration_sec, trading_days.
+        """
+        strategy_metrics = self.get_strategy_metrics()
+
+        total_trades = 0
+        total_wins = 0
+        total_losses = 0
+        total_pnl = 0.0
+
+        for metrics in strategy_metrics.values():
+            total_trades += int(metrics.get("trades", 0))
+            total_wins += int(metrics.get("wins", 0))
+            total_losses += int(metrics.get("losses", 0))
+            total_pnl += metrics.get("pnl", 0.0)
+
+        # Compute gross profit / gross loss from per-strategy PnL
+        gross_profit = sum(
+            m.get("pnl", 0.0) for m in strategy_metrics.values() if m.get("pnl", 0.0) > 0
+        )
+        gross_loss = sum(
+            m.get("pnl", 0.0) for m in strategy_metrics.values() if m.get("pnl", 0.0) < 0
+        )
+
+        # Drawdown from current equity
+        equity = self.get_equity()
+        _dd_amount, dd_pct = self.get_drawdown(equity)
+        daily_pnl = self.get_daily_pnl(equity)
+
+        # Approximate trading days from equity history length
+        trading_days = max(1, len(self._equity_history) // 288) if self._equity_history else 1
+
+        return {
+            "total_trades": total_trades,
+            "wins": total_wins,
+            "losses": total_losses,
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "total_pnl": total_pnl,
+            "daily_pnl": daily_pnl,
+            "max_drawdown": _dd_amount,
+            "max_drawdown_pct": dd_pct,
+            "avg_trade_duration_sec": 0.0,  # Duration tracking not yet implemented
+            "trading_days": trading_days,
+        }
+
     def _invalidate_metrics_cache(self) -> None:
         """Invalidate metrics cache when data changes."""
         self._metrics_cache = None

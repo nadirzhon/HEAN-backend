@@ -11,27 +11,48 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/graph-engine", tags=["graph-engine"])
 
 
+def _get_graph_engine(request: Request):
+    """Get graph engine from facade, with graceful degradation."""
+    engine_facade = getattr(request.state, "engine_facade", None)
+    if not engine_facade:
+        return None
+
+    # Try facade-level attribute first (set by EngineFacade.start())
+    graph_engine = getattr(engine_facade, "_graph_engine", None)
+    if graph_engine is not None:
+        return graph_engine
+
+    # Fallback: drill into trading_system
+    trading_system = getattr(engine_facade, "_trading_system", None)
+    if trading_system is not None:
+        return getattr(trading_system, "_graph_engine", None)
+
+    return None
+
+
+def _offline_response(detail: str) -> dict[str, Any]:
+    """Return a structured offline response instead of raising 503."""
+    return {
+        "status": "offline",
+        "detail": detail,
+        "hint": "Set GRAPH_ENGINE_ENABLED=true in .env and restart the engine.",
+    }
+
+
 @router.get("/state")
 async def get_graph_state(request: Request) -> dict[str, Any]:
     """Get current graph engine state (assets, correlations, etc.)."""
+    graph_engine = _get_graph_engine(request)
+    if graph_engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Graph engine offline. Module not initialized. "
+                "Ensure GRAPH_ENGINE_ENABLED=true in .env and the engine is running."
+            ),
+        )
+
     try:
-        engine_facade = request.state.engine_facade
-
-        if not engine_facade or not hasattr(engine_facade, '_trading_system'):
-            raise HTTPException(
-                status_code=503,
-                detail="Graph engine not available - trading system not initialized"
-            )
-
-        trading_system = engine_facade._trading_system
-        if not hasattr(trading_system, '_graph_engine'):
-            raise HTTPException(
-                status_code=503,
-                detail="Graph engine not available - module not initialized"
-            )
-
-        graph_engine = trading_system._graph_engine
-
         # Get asset data
         assets = []
         symbols = graph_engine._symbols if hasattr(graph_engine, '_symbols') else []
@@ -44,8 +65,11 @@ async def get_graph_state(request: Request) -> dict[str, Any]:
                 "leader_score": 0.0
             }
 
-            if hasattr(graph_engine, 'get_correlation'):
-                asset_data["leader_score"] = graph_engine.get_lead_lag("BTCUSDT", symbol) if symbol != "BTCUSDT" else 1.0
+            if hasattr(graph_engine, 'get_lead_lag'):
+                asset_data["leader_score"] = (
+                    graph_engine.get_lead_lag("BTCUSDT", symbol)
+                    if symbol != "BTCUSDT" else 1.0
+                )
 
             assets.append(asset_data)
 
@@ -62,8 +86,6 @@ async def get_graph_state(request: Request) -> dict[str, Any]:
             "correlations": correlations,
             "asset_count": len(assets)
         }
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error getting graph state: {e}")
         raise HTTPException(
@@ -75,24 +97,17 @@ async def get_graph_state(request: Request) -> dict[str, Any]:
 @router.get("/leader")
 async def get_leader(request: Request) -> dict[str, Any]:
     """Get current market leader."""
+    graph_engine = _get_graph_engine(request)
+    if graph_engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Graph engine offline. Module not initialized. "
+                "Ensure GRAPH_ENGINE_ENABLED=true in .env and the engine is running."
+            ),
+        )
+
     try:
-        engine_facade = request.state.engine_facade
-
-        if not engine_facade or not hasattr(engine_facade, '_trading_system'):
-            raise HTTPException(
-                status_code=503,
-                detail="Graph engine not available - trading system not initialized"
-            )
-
-        trading_system = engine_facade._trading_system
-        if not hasattr(trading_system, '_graph_engine'):
-            raise HTTPException(
-                status_code=503,
-                detail="Graph engine not available - module not initialized"
-            )
-
-        graph_engine = trading_system._graph_engine
-
         leader = graph_engine.get_current_leader()
         if not leader:
             raise HTTPException(
@@ -130,28 +145,25 @@ async def get_leader(request: Request) -> dict[str, Any]:
 @router.get("/feature-vector")
 async def get_feature_vector(request: Request, size: int = 5000) -> dict[str, Any]:
     """Get high-dimensional feature vector for neural network."""
+    graph_engine = _get_graph_engine(request)
+    if graph_engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Graph engine offline. Module not initialized. "
+                "Ensure GRAPH_ENGINE_ENABLED=true in .env and the engine is running."
+            ),
+        )
+
     try:
-        engine_facade = request.state.engine_facade
-
-        if not engine_facade or not hasattr(engine_facade, '_trading_system'):
-            raise HTTPException(
-                status_code=503,
-                detail="Graph engine not available - trading system not initialized"
-            )
-
-        trading_system = engine_facade._trading_system
-        if not hasattr(trading_system, '_graph_engine'):
-            raise HTTPException(
-                status_code=503,
-                detail="Graph engine not available - module not initialized"
-            )
-
-        graph_engine = trading_system._graph_engine
-
         if hasattr(graph_engine, 'get_feature_vector'):
             feature_vector = graph_engine.get_feature_vector(size)
             return {
-                "feature_vector": feature_vector[:size] if isinstance(feature_vector, list) else feature_vector.tolist()[:size],
+                "feature_vector": (
+                    feature_vector[:size]
+                    if isinstance(feature_vector, list)
+                    else feature_vector.tolist()[:size]
+                ),
                 "size": len(feature_vector) if isinstance(feature_vector, list) else len(feature_vector)
             }
 
@@ -171,26 +183,35 @@ async def get_feature_vector(request: Request, size: int = 5000) -> dict[str, An
 
 @router.get("/topology/score")
 async def get_topology_score(request: Request) -> dict[str, Any]:
-    """Get market topology score (TDA-based structural stability)."""
-    try:
-        try:
-            import graph_engine_py  # type: ignore
-            fast_warden = graph_engine_py.FastWarden()
-            market_score = fast_warden.get_market_topology_score()
-            is_disconnected = fast_warden.is_market_disconnected()
+    """Get market topology score (TDA-based structural stability).
 
-            return {
-                "market_topology_score": market_score,
-                "is_disconnected": is_disconnected,
-                "stability": "stable" if market_score > 0.7 else "unstable" if market_score > 0.4 else "collapsing",
-            }
-        except ImportError:
-            raise HTTPException(
-                status_code=503,
-                detail="FastWarden not available - C++ graph engine module not loaded"
-            ) from None
-    except HTTPException:
-        raise
+    FastWarden (C++ binary) is optional. Returns graceful degradation
+    when the binary is not compiled/available.
+    """
+    try:
+        import graph_engine_py  # type: ignore
+        fast_warden = graph_engine_py.FastWarden()
+        market_score = fast_warden.get_market_topology_score()
+        is_disconnected = fast_warden.is_market_disconnected()
+
+        return {
+            "market_topology_score": market_score,
+            "is_disconnected": is_disconnected,
+            "stability": (
+                "stable" if market_score > 0.7
+                else "unstable" if market_score > 0.4
+                else "collapsing"
+            ),
+        }
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "FastWarden offline. C++ graph_engine_py module is not compiled. "
+                "Build with: cd cpp && cmake --build build. "
+                "The Python Graph Engine fallback does not support TDA topology scoring."
+            ),
+        ) from None
     except Exception as e:
         logger.error(f"Error getting topology score: {e}")
         raise HTTPException(
@@ -203,33 +224,24 @@ async def get_topology_score(request: Request) -> dict[str, Any]:
 async def get_manifold_data(request: Request, symbol: str) -> dict[str, Any]:
     """Get 3D manifold data for visualization (topological holes overlay)."""
     try:
-        engine_facade = request.state.engine_facade
-
-        if not engine_facade or not hasattr(engine_facade, '_trading_system'):
-            raise HTTPException(
-                status_code=503,
-                detail="TDA engine not available - trading system not initialized"
-            )
-
-        # Try FastWarden for manifold data
-        try:
-            import graph_engine_py  # type: ignore
-            fast_warden = graph_engine_py.FastWarden()
-            manifold = fast_warden.get_manifold_data(symbol)
-            return {
-                "symbol": symbol,
-                "point_cloud": manifold.get("points", []),
-                "persistence_barcodes": manifold.get("barcodes", []),
-                "num_holes": manifold.get("num_holes", 0),
-                "topology_score": manifold.get("score", 0.0),
-            }
-        except (ImportError, AttributeError):
-            raise HTTPException(
-                status_code=503,
-                detail="FastWarden not available for manifold data"
-            ) from None
-    except HTTPException:
-        raise
+        import graph_engine_py  # type: ignore
+        fast_warden = graph_engine_py.FastWarden()
+        manifold = fast_warden.get_manifold_data(symbol)
+        return {
+            "symbol": symbol,
+            "point_cloud": manifold.get("points", []),
+            "persistence_barcodes": manifold.get("barcodes", []),
+            "num_holes": manifold.get("num_holes", 0),
+            "topology_score": manifold.get("score", 0.0),
+        }
+    except (ImportError, AttributeError):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "FastWarden offline. C++ graph_engine_py module is not compiled. "
+                "Manifold data requires the C++ TDA engine."
+            ),
+        ) from None
     except Exception as e:
         logger.error(f"Error getting manifold data for {symbol}: {e}")
         raise HTTPException(
@@ -241,37 +253,39 @@ async def get_manifold_data(request: Request, symbol: str) -> dict[str, Any]:
 @router.get("/topology/watchdog")
 async def get_watchdog_status(request: Request) -> dict[str, Any]:
     """Get Topological Watchdog status."""
+    engine_facade = getattr(request.state, "engine_facade", None)
+    trading_system = getattr(engine_facade, "_trading_system", None) if engine_facade else None
+
+    if trading_system and hasattr(trading_system, '_topological_watchdog'):
+        watchdog = trading_system._topological_watchdog
+        if watchdog is not None:
+            try:
+                return watchdog.get_topology_status()
+            except Exception as e:
+                logger.error(f"Error getting watchdog status: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Internal error retrieving watchdog status: {str(e)}"
+                ) from e
+
+    # Fallback: try FastWarden directly
     try:
-        engine_facade = request.state.engine_facade
-
-        if not engine_facade or not hasattr(engine_facade, '_trading_system'):
-            raise HTTPException(
-                status_code=503,
-                detail="Topological watchdog not available - trading system not initialized"
-            )
-
-        trading_system = engine_facade._trading_system
-        if hasattr(trading_system, '_topological_watchdog'):
-            watchdog = trading_system._topological_watchdog
-            status = watchdog.get_topology_status()
-            return status
-
-        # Fallback: check FastWarden directly
-        try:
-            import graph_engine_py  # type: ignore
-            fast_warden = graph_engine_py.FastWarden()
-            return {
-                "halt_active": fast_warden.is_market_disconnected(),
-                "topology_score": fast_warden.get_market_topology_score(),
-                "is_disconnected": fast_warden.is_market_disconnected(),
-            }
-        except ImportError:
-            raise HTTPException(
-                status_code=503,
-                detail="Topological watchdog not available - FastWarden module not loaded"
-            ) from None
-    except HTTPException:
-        raise
+        import graph_engine_py  # type: ignore
+        fast_warden = graph_engine_py.FastWarden()
+        return {
+            "halt_active": fast_warden.is_market_disconnected(),
+            "topology_score": fast_warden.get_market_topology_score(),
+            "is_disconnected": fast_warden.is_market_disconnected(),
+        }
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Topological watchdog offline. Neither the Python watchdog nor "
+                "the C++ FastWarden module are available. "
+                "Ensure GRAPH_ENGINE_ENABLED=true and/or compile the C++ module."
+            ),
+        ) from None
     except Exception as e:
         logger.error(f"Error getting watchdog status: {e}")
         raise HTTPException(

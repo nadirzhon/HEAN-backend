@@ -22,7 +22,7 @@ from slowapi.util import get_remote_address
 
 from hean.api.auth import set_middleware_redis, setup_auth
 from hean.api.engine_facade import EngineFacade
-from hean.api.schemas import WebSocketMessage
+from hean.api.schemas import AUTO_SUBSCRIBE_TOPICS, WebSocketMessage
 from hean.api.services.market_data_store import market_data_store
 from hean.api.services.prometheus_metrics import metrics_updater_loop
 from hean.api.services.trading_metrics import trading_metrics
@@ -417,6 +417,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to initialize WebSocket service: {e}")
         websocket_service = None
+
+    # Initialize SSE event stream service (wire to EventBus for /api/v1/events/stream)
+    try:
+        from hean.api.services.event_stream import event_stream_service
+        event_stream_service.set_bus(bus)
+        await event_stream_service.start()
+        logger.info("EVENT_STREAM_SERVICE_INIT_OK")
+    except Exception as e:
+        logger.warning(f"EVENT_STREAM_SERVICE_INIT_FAIL: {e}")
 
     # Initialize killswitch (will be connected to engine facade later)
     killswitch = KillSwitch(bus)
@@ -868,6 +877,7 @@ async def forward_events_to_topics():
             EventType.ORDER_PLACED,
             EventType.ORDER_FILLED,
             EventType.ORDER_CANCELLED,
+            EventType.ORDER_REJECTED,
         }:
             return
 
@@ -967,7 +977,7 @@ async def forward_events_to_topics():
                 symbol=payload.get("symbol"),
                 strategy_id=payload.get("strategy_id"),
             )
-        elif event.event_type in (EventType.ORDER_FILLED, EventType.ORDER_CANCELLED):
+        elif event.event_type in (EventType.ORDER_FILLED, EventType.ORDER_CANCELLED, EventType.ORDER_REJECTED):
             order_update_payload = {
                 "order_id": payload.get("order_id"),
                 "status": status_value.upper(),
@@ -991,61 +1001,89 @@ async def forward_events_to_topics():
                 strategy_id=payload.get("strategy_id"),
             )
 
-        await sync_trading_state_from_engine(reason=f"order_{event.event_type.value}")
+        # Offload full engine state sync to background -- this is heavy I/O
+        # (fetches full snapshot from engine facade + Redis write + WS broadcast)
+        # and must not block the EventBus dispatch path.
+        asyncio.create_task(
+            sync_trading_state_from_engine(reason=f"order_{event.event_type.value}")
+        )
 
     async def handle_pnl_update(event: Event) -> None:
-        """Fan-out account/position snapshots."""
+        """Fan-out account/position snapshots.
+
+        BUG FIX (Bug #10): This handler previously blocked the EventBus dispatch
+        loop for 6+ seconds due to sequential Redis writes, WebSocket broadcasts,
+        and telemetry recording.  Now offloads the heavy I/O to a fire-and-forget
+        background task so the handler returns immediately, unblocking the dispatch
+        batch for other events (especially time-critical ORDER_DECISION).
+        """
         if event.event_type != EventType.PNL_UPDATE:
             return
+
+        # Extract data synchronously (cheap dict copy) then offload I/O
         snapshot = {
             "account_state": event.data.get("account_state"),
             "positions": event.data.get("positions") or [],
             "orders": event.data.get("orders") or [],
         }
-        await update_trading_state_from_snapshot(snapshot)
-        account_state = snapshot.get("account_state") or {}
-        await emit_topic_event(
-            topic="account_state",
-            event_type="PNL_UPDATE",
-            payload=account_state,
-            source="engine",
-            context={"reason": "pnl_update"},
-        )
-        if snapshot["positions"]:
+        asyncio.create_task(_pnl_update_fanout(snapshot))
+
+    async def _pnl_update_fanout(snapshot: dict[str, Any]) -> None:
+        """Background task for PNL update fan-out (Redis + WS + telemetry).
+
+        Runs outside the EventBus dispatch path so it cannot block other handlers.
+        Errors are caught and logged rather than propagated.
+        """
+        try:
+            await update_trading_state_from_snapshot(snapshot)
+            account_state = snapshot.get("account_state") or {}
             await emit_topic_event(
-                topic="positions",
+                topic="account_state",
                 event_type="PNL_UPDATE",
-                payload={"positions": snapshot["positions"], "type": "pnl_update"},
+                payload=account_state,
                 source="engine",
+                context={"reason": "pnl_update"},
             )
+            if snapshot["positions"]:
+                await emit_topic_event(
+                    topic="positions",
+                    event_type="PNL_UPDATE",
+                    payload={"positions": snapshot["positions"], "type": "pnl_update"},
+                    source="engine",
+                )
 
-        # Emit PNL_SNAPSHOT for funnel (every 2-5 seconds, throttled)
-        global last_account_broadcast
-        now = time.time()
-        if now - last_account_broadcast >= 2.0:  # Throttle to every 2 seconds
-            last_account_broadcast = now
-            pnl_snapshot_payload = {
-                "equity": account_state.get("equity", 0.0),
-                "balance": account_state.get("wallet_balance", account_state.get("balance", 0.0)),
-                "unrealized_pnl": account_state.get("unrealized_pnl", 0.0),
-                "realized_pnl": account_state.get("realized_pnl", 0.0),
-                "fees": account_state.get("fees", 0.0),
-                "used_margin": account_state.get("used_margin", 0.0),
-                "free_margin": account_state.get("available_balance", account_state.get("free_margin", 0.0)),
-            }
-            await emit_topic_event(
-                topic="trading_events",
-                event_type="PNL_SNAPSHOT",
-                payload=pnl_snapshot_payload,
-                source="engine",
-                context={"reason": "periodic_snapshot"},
-            )
+            # Emit PNL_SNAPSHOT for funnel (every 2-5 seconds, throttled)
+            global last_account_broadcast
+            now = time.time()
+            if now - last_account_broadcast >= 2.0:  # Throttle to every 2 seconds
+                last_account_broadcast = now
+                pnl_snapshot_payload = {
+                    "equity": account_state.get("equity", 0.0),
+                    "balance": account_state.get("wallet_balance", account_state.get("balance", 0.0)),
+                    "unrealized_pnl": account_state.get("unrealized_pnl", 0.0),
+                    "realized_pnl": account_state.get("realized_pnl", 0.0),
+                    "fees": account_state.get("fees", 0.0),
+                    "used_margin": account_state.get("used_margin", 0.0),
+                    "free_margin": account_state.get("available_balance", account_state.get("free_margin", 0.0)),
+                }
+                await emit_topic_event(
+                    topic="trading_events",
+                    event_type="PNL_SNAPSHOT",
+                    payload=pnl_snapshot_payload,
+                    source="engine",
+                    context={"reason": "periodic_snapshot"},
+                )
 
-            # Update metrics
-            await trading_metrics.update_pnl(
-                unrealized=pnl_snapshot_payload["unrealized_pnl"],
-                realized=pnl_snapshot_payload["realized_pnl"],
-                equity=pnl_snapshot_payload["equity"],
+                # Update metrics
+                await trading_metrics.update_pnl(
+                    unrealized=pnl_snapshot_payload["unrealized_pnl"],
+                    realized=pnl_snapshot_payload["realized_pnl"],
+                    equity=pnl_snapshot_payload["equity"],
+                )
+        except Exception as exc:
+            logger.error(
+                "[PNL_FANOUT] Background PNL update fan-out failed: %s", exc,
+                exc_info=True,
             )
 
     async def handle_position_event(event: Event) -> None:
@@ -1114,7 +1152,10 @@ async def forward_events_to_topics():
             strategy_id=payload.get("strategy_id"),
         )
 
-        await sync_trading_state_from_engine(reason=f"position_{event.event_type.value}")
+        # Offload full engine state sync to background (heavy I/O)
+        asyncio.create_task(
+            sync_trading_state_from_engine(reason=f"position_{event.event_type.value}")
+        )
 
     async def handle_order_decision(event: Event) -> None:
         """Forward ORDER_DECISION telemetry to clients and Redis."""
@@ -1222,10 +1263,11 @@ async def forward_events_to_topics():
             )
 
     async def handle_risk_event(event: Event) -> None:
-        """Broadcast risk events to dedicated topic."""
-        if event.event_type == EventType.RISK_BLOCKED:
+        """Broadcast risk events (RISK_BLOCKED and RISK_ALERT) to dedicated topic."""
+        if event.event_type in {EventType.RISK_BLOCKED, EventType.RISK_ALERT}:
+            event_name = event.event_type.value  # "risk_blocked" or "risk_alert"
             payload = {
-                "type": "risk_blocked",
+                "type": event_name,
                 "reason": event.data.get("reason"),
                 "symbol": event.data.get("symbol"),
                 "strategy_id": event.data.get("strategy_id"),
@@ -1234,7 +1276,7 @@ async def forward_events_to_topics():
             }
             await emit_topic_event(
                 topic="risk_events",
-                event_type="RISK_BLOCKED",
+                event_type=event_name.upper(),
                 payload=payload,
                 source="engine",
                 severity="WARN",
@@ -1290,6 +1332,7 @@ async def forward_events_to_topics():
     bus.subscribe(EventType.ORDER_PLACED, handle_order)
     bus.subscribe(EventType.ORDER_FILLED, handle_order)
     bus.subscribe(EventType.ORDER_CANCELLED, handle_order)
+    bus.subscribe(EventType.ORDER_REJECTED, handle_order)
     bus.subscribe(EventType.PNL_UPDATE, handle_pnl_update)
     bus.subscribe(EventType.POSITION_OPENED, handle_position_event)
     bus.subscribe(EventType.POSITION_CLOSED, handle_position_event)
@@ -1298,6 +1341,7 @@ async def forward_events_to_topics():
     bus.subscribe(EventType.ORDER_EXIT_DECISION, handle_order_exit_decision)
     bus.subscribe(EventType.KILLSWITCH_TRIGGERED, handle_killswitch)
     bus.subscribe(EventType.RISK_BLOCKED, handle_risk_event)
+    bus.subscribe(EventType.RISK_ALERT, handle_risk_event)
     bus.subscribe(EventType.PHYSICS_UPDATE, handle_physics_update)
     bus.subscribe(EventType.BRAIN_ANALYSIS, handle_brain_analysis)
 
@@ -1306,18 +1350,98 @@ async def forward_events_to_topics():
         await asyncio.sleep(1)
 
 async def forward_redis_to_topics():
-    """Forward Redis pub/sub messages to WebSocket topics."""
+    """Forward Redis stream messages to WebSocket topics.
+
+    Polls physics:{symbol} and brain:signals streams and broadcasts the data
+    to connected WebSocket clients.  This bridges the microservice containers
+    (physics, brain) with the dashboard.
+    """
     if not redis_state_manager:
         return
 
-    # Subscribe to Redis channels and forward to WebSocket topics
-    # This allows C++ core to publish directly to Redis and have it streamed to frontend
     try:
-        # In a real implementation, we'd subscribe to Redis pub/sub channels
-        # For now, we'll use state updates
-        pass
-    except Exception as e:
-        logger.error(f"Error forwarding Redis to topics: {e}")
+        import orjson
+    except ImportError:
+        logger.warning("orjson not installed, Redis->WS forwarding disabled")
+        return
+
+    redis_client = redis_state_manager._client
+    if not redis_client:
+        return
+
+    symbols = settings.trading_symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+    # Track last-read stream IDs
+    last_ids: dict[str, bytes] = {}
+    for sym in symbols:
+        last_ids[f"physics:{sym}"] = b"$"
+    last_ids["brain:signals"] = b"$"
+
+    logger.info(
+        f"Redis->WS forwarder started for streams: {list(last_ids.keys())}"
+    )
+
+    while True:
+        try:
+            # Read from all streams with 1-second block
+            streams_arg = {k: v for k, v in last_ids.items()}
+            results = await redis_client.xread(streams_arg, count=10, block=1000)
+
+            for stream_name_bytes, messages in results:
+                stream_name = (
+                    stream_name_bytes.decode()
+                    if isinstance(stream_name_bytes, bytes)
+                    else stream_name_bytes
+                )
+                for msg_id, msg_data in messages:
+                    last_ids[stream_name] = msg_id
+
+                    data_bytes = msg_data.get(b"data") or msg_data.get("data")
+                    if not data_bytes:
+                        continue
+
+                    if isinstance(data_bytes, bytes):
+                        payload = orjson.loads(data_bytes)
+                    else:
+                        payload = orjson.loads(data_bytes.encode())
+
+                    # Route physics streams to physics_update topic
+                    if stream_name.startswith("physics:"):
+                        await connection_manager.broadcast_to_topic(
+                            "physics_update",
+                            {
+                                "type": "PHYSICS_UPDATE",
+                                "temperature": payload.get("temperature", 0.0),
+                                "entropy": payload.get("entropy", 0.0),
+                                "phase": payload.get("phase", "unknown"),
+                                "symbol": payload.get("symbol", ""),
+                                "price": payload.get("price", 0.0),
+                                "timestamp": payload.get("timestamp"),
+                            },
+                        )
+
+                    # Route brain streams to brain_update topic
+                    elif stream_name == "brain:signals":
+                        await connection_manager.broadcast_to_topic(
+                            "brain_update",
+                            {
+                                "type": "BRAIN_ANALYSIS",
+                                "stage": "analyze",
+                                "content": (
+                                    f"{payload.get('symbol', '?')} "
+                                    f"{payload.get('signal', 'HOLD')} "
+                                    f"(conf={payload.get('confidence', 0):.2f})"
+                                ),
+                                "confidence": payload.get("confidence", 0.5),
+                                "analysis": payload,
+                            },
+                        )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"Redis->WS forwarder error: {e}")
+            await asyncio.sleep(2.0)
 
 async def broadcast_metrics_periodically():
     """Periodically broadcast engine metrics to WebSocket clients."""
@@ -1505,14 +1629,17 @@ from hean.api.routers import (  # noqa: E402
     archon,
     auth_management,
     autopilot,
+    blackbox,
     brain,
     causal_inference,
     changelog,
     config as config_router_module,
     council,
     engine,
+    events,
     experiments,
     graph_engine,
+    journal,
     logs_intelligence,
     market,
     meta_brain,
@@ -1528,6 +1655,7 @@ from hean.api.routers import (  # noqa: E402
     telemetry,
     temporal,
     trading,
+    ws,
 )
 
 API_PREFIX = "/api/v1"
@@ -1560,6 +1688,10 @@ app.include_router(storage.router, prefix=API_PREFIX)
 app.include_router(council.router, prefix=API_PREFIX)
 app.include_router(meta_brain.router, prefix=API_PREFIX)
 app.include_router(experiments.router, prefix=f"{API_PREFIX}/experiments", tags=["experiments"])
+app.include_router(blackbox.router, prefix=API_PREFIX)
+app.include_router(journal.router, prefix=API_PREFIX)
+app.include_router(ws.router, prefix=API_PREFIX)
+app.include_router(events.router, prefix=API_PREFIX)
 
 
 # Prometheus metrics endpoint (no prefix — Prometheus scrapes /metrics directly)
@@ -1612,6 +1744,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
     await connection_manager.connect(websocket, connection_id, initial_state_provider=_get_initial_state)
     logger.info(f"[HEAN API] WebSocket connection established: {connection_id}")
+
+    # Auto-subscribe to ALL trading topics so dashboard receives events
+    # without needing to send individual subscribe messages.
+    for auto_topic in AUTO_SUBSCRIBE_TOPICS:
+        connection_manager.subscribe(connection_id, auto_topic)
+    logger.info(
+        f"[HEAN API] Auto-subscribed {connection_id} to {len(AUTO_SUBSCRIBE_TOPICS)} topics"
+    )
 
     # Keepalive task to send periodic pings
     keepalive_task = None
@@ -2051,6 +2191,46 @@ async def health_check(request: Request) -> dict[str, Any]:
     if status_code == 503:
         return JSONResponse(content=response, status_code=503)
     return response
+
+
+# Readiness probe — returns 200 ONLY when all subsystems are initialized
+@app.get("/ready")
+@limiter.limit("120/minute")
+async def readiness_probe(request: Request) -> JSONResponse:
+    """Readiness probe for orchestrators (Kubernetes, Docker Compose, frontend).
+
+    Returns HTTP 200 only when the engine, event bus, and Redis are all ready.
+    Returns HTTP 503 with details while the system is still initializing.
+    """
+    checks: dict[str, bool] = {}
+
+    # 1. Event bus must be started
+    checks["event_bus"] = bus is not None
+
+    # 2. Engine facade must exist and be running
+    checks["engine"] = engine_facade is not None and engine_facade.is_running
+
+    # 3. Redis connection (optional but tracked)
+    redis_ok = False
+    if redis_state_manager:
+        try:
+            await redis_state_manager._client.ping()
+            redis_ok = True
+        except Exception:
+            redis_ok = False
+    checks["redis"] = redis_ok
+
+    all_ready = checks["event_bus"] and checks["engine"]
+
+    response_body = {
+        "ready": all_ready,
+        "checks": checks,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+    if all_ready:
+        return JSONResponse(content=response_body, status_code=200)
+    return JSONResponse(content=response_body, status_code=503)
 
 
 # Settings endpoint (secrets masked) - REQUIRES AUTHENTICATION

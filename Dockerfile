@@ -32,7 +32,9 @@ RUN pip install --no-cache-dir \
     duckdb>=1.0.0 \
     polars>=0.20.0 \
     pyarrow>=15.0.0 \
-    python-socketio>=5.10.0
+    python-socketio>=5.10.0 \
+    openai>=1.0.0 \
+    anthropic>=0.30.0
 
 # Copy workspace packages
 COPY packages/ ./packages/

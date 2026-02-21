@@ -247,21 +247,63 @@ class WebSocketTopicType(str, Enum):
     """Valid WebSocket subscription topics."""
 
     SYSTEM_STATUS = "system_status"
+    SYSTEM_HEARTBEAT = "system_heartbeat"
     TELEMETRY = "telemetry"
     MARKET_DATA = "market_data"
+    MARKET_TICKS = "market_ticks"
+    SIGNALS = "signals"
     TRADING_SIGNALS = "trading_signals"
-    POSITIONS = "positions"
     ORDERS = "orders"
+    ORDERS_SNAPSHOT = "orders_snapshot"
+    ORDER_FILLED = "order_filled"
+    ORDER_CANCELLED = "order_cancelled"
+    ORDER_DECISIONS = "order_decisions"
+    ORDER_EXIT_DECISIONS = "order_exit_decisions"
+    POSITIONS = "positions"
+    ACCOUNT_STATE = "account_state"
+    TRADING_EVENTS = "trading_events"
+    TRADING_METRICS = "trading_metrics"
+    METRICS = "metrics"
+    RISK_EVENTS = "risk_events"
+    STRATEGY_EVENTS = "strategy_events"
+    PHYSICS_UPDATE = "physics_update"
+    BRAIN_UPDATE = "brain_update"
+    AI_REASONING = "ai_reasoning"
+    AI_CATALYST = "ai_catalyst"
+    TRIANGULAR_ARB = "triangular_arb"
     PERFORMANCE = "performance"
     RISK = "risk"
     LOGS = "logs"
     SNAPSHOT = "snapshot"
-    SYSTEM_HEARTBEAT = "system_heartbeat"  # UI compatibility
-    ORDER_DECISIONS = "order_decisions"  # UI compatibility
-    RISK_EVENTS = "risk_events"  # UI compatibility
-    STRATEGY_EVENTS = "strategy_events"  # UI compatibility
-    MARKET_TICKS = "market_ticks"  # UI compatibility
-    TRADING_METRICS = "trading_metrics"  # UI compatibility
+
+
+# Topics that every new WebSocket client should be auto-subscribed to.
+# This ensures the dashboard receives all trading events without
+# having to manually send subscribe messages for each topic.
+AUTO_SUBSCRIBE_TOPICS: list[str] = [
+    WebSocketTopicType.SYSTEM_STATUS.value,
+    WebSocketTopicType.SYSTEM_HEARTBEAT.value,
+    WebSocketTopicType.SIGNALS.value,
+    WebSocketTopicType.ORDERS.value,
+    WebSocketTopicType.ORDERS_SNAPSHOT.value,
+    WebSocketTopicType.ORDER_FILLED.value,
+    WebSocketTopicType.ORDER_CANCELLED.value,
+    WebSocketTopicType.ORDER_DECISIONS.value,
+    WebSocketTopicType.ORDER_EXIT_DECISIONS.value,
+    WebSocketTopicType.POSITIONS.value,
+    WebSocketTopicType.ACCOUNT_STATE.value,
+    WebSocketTopicType.TRADING_EVENTS.value,
+    WebSocketTopicType.TRADING_METRICS.value,
+    WebSocketTopicType.METRICS.value,
+    WebSocketTopicType.RISK_EVENTS.value,
+    WebSocketTopicType.STRATEGY_EVENTS.value,
+    WebSocketTopicType.PHYSICS_UPDATE.value,
+    WebSocketTopicType.BRAIN_UPDATE.value,
+    WebSocketTopicType.AI_REASONING.value,
+    WebSocketTopicType.AI_CATALYST.value,
+    WebSocketTopicType.MARKET_DATA.value,
+    WebSocketTopicType.MARKET_TICKS.value,
+]
 
 
 class WebSocketMessage(BaseModel):

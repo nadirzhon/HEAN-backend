@@ -372,3 +372,40 @@ class CorrelationEngine:
         Returns 0.0 if not available.
         """
         return self._correlation_matrix.get((symbol_a, symbol_b), 0.0)
+
+    def get_data_status(self) -> dict[str, Any]:
+        """Get data collection status for all tracked symbols.
+
+        Returns:
+            Dictionary with data sufficiency information per symbol
+        """
+        min_required = 50
+        status: dict[str, Any] = {
+            "min_required_returns": min_required,
+            "symbols_total": len(self._symbols),
+            "symbols_with_data": 0,
+            "symbols_ready": 0,
+            "per_symbol": {},
+        }
+
+        for symbol in self._symbols:
+            price_count = len(self._price_history.get(symbol, []))
+            returns_count = len(self._returns_history.get(symbol, []))
+            is_ready = returns_count >= min_required
+
+            if returns_count > 0:
+                status["symbols_with_data"] += 1
+            if is_ready:
+                status["symbols_ready"] += 1
+
+            status["per_symbol"][symbol] = {
+                "price_points": price_count,
+                "returns_points": returns_count,
+                "ready": is_ready,
+                "progress_pct": round(
+                    min(returns_count / min_required, 1.0) * 100, 1
+                ),
+            }
+
+        status["has_sufficient_data"] = status["symbols_ready"] >= 2
+        return status

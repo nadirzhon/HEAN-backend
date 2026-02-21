@@ -109,14 +109,25 @@ class RiskLimits:
         self._reset_daily_counters_if_needed()
 
         # Universal daily attempts limit for all strategies
+        # BUG FIX (2026-02-21): Increased limits to reduce DAILY_LIMIT blocks
+        # (was blocking 33.6% of decisions). Default raised from 50 to 200.
+        # All enabled strategies need headroom: 11 strategies * N signals/day.
         attempts_map = {
             "impulse_engine": settings.impulse_max_attempts_per_day,
-            "hf_scalping": 60,
-            "momentum_trader": 40,
-            "paper_assist_micro": 100,
+            "hf_scalping": 200,
+            "momentum_trader": 150,
+            "paper_assist_micro": 200,
+            "funding_harvester": 100,
+            "basis_arbitrage": 100,
+            "enhanced_grid": 150,
+            "inventory_neutral_mm": 200,
+            "correlation_arb": 100,
+            "rebate_farmer": 200,
+            "sentiment_strategy": 100,
+            "liquidity_sweep": 100,
         }
 
-        max_attempts = attempts_map.get(strategy_id, 50)  # default: 50
+        max_attempts = attempts_map.get(strategy_id, 200)  # default: 200
 
         # Stricter limit in IMPULSE regime (only for impulse_engine)
         if strategy_id == "impulse_engine" and regime and regime.value == "impulse":

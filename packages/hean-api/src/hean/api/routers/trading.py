@@ -83,10 +83,41 @@ async def get_position_monitor_stats(request: Request) -> dict:
         # Get position monitor from trading system
         trading_system = getattr(request.app.state, "trading_system", None)
         if not trading_system or not hasattr(trading_system, "_position_monitor"):
-            raise HTTPException(status_code=500, detail="Position monitor not available")
+            # Return empty/default stats when monitor is not yet initialized
+            return {
+                "positions_force_closed": 0,
+                "positions_profit_protected": 0,
+                "positions_trailing_stopped": 0,
+                "force_close_enabled": False,
+                "profit_protection_enabled": False,
+                "max_hold_seconds": 0,
+                "check_interval_seconds": 0,
+                "tracked_positions": 0,
+                "recent_force_closes": [],
+                "position_states": [],
+                "status": "not_initialized",
+            }
 
-        stats = trading_system._position_monitor.get_statistics()
+        monitor = trading_system._position_monitor
+        if monitor is None:
+            return {
+                "positions_force_closed": 0,
+                "positions_profit_protected": 0,
+                "positions_trailing_stopped": 0,
+                "force_close_enabled": False,
+                "profit_protection_enabled": False,
+                "max_hold_seconds": 0,
+                "check_interval_seconds": 0,
+                "tracked_positions": 0,
+                "recent_force_closes": [],
+                "position_states": [],
+                "status": "not_initialized",
+            }
+
+        stats = monitor.get_statistics()
         return stats
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get position monitor stats: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -647,6 +678,87 @@ async def why_not_trading(request: Request) -> dict:
             "execution_quality": {},
             "multi_symbol": {"enabled": False},
         }
+
+
+@why_router.get("/history")
+async def get_trading_history(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    symbol: str | None = Query(default=None, description="Filter by symbol"),
+) -> dict:
+    """Get trading history (orders, fills, and position lifecycle events).
+
+    Returns a merged timeline of all trading activity sorted by most recent first.
+    """
+    facade = _get_facade(request)
+    history: list[dict] = []
+
+    # Get orders (filled, cancelled, etc.)
+    try:
+        result = await facade.get_orders(status="all")  # type: ignore
+        orders = result if isinstance(result, list) else []
+        for order in orders:
+            if isinstance(order, dict):
+                order["event_kind"] = "order"
+                if symbol and order.get("symbol") != symbol:
+                    continue
+                history.append(order)
+    except Exception as e:
+        logger.debug(f"Failed to get orders for history: {e}")
+
+    # Get closed positions
+    try:
+        from hean.api import main as api_main
+
+        async with api_main.trading_state_lock:
+            cached_positions = list(
+                api_main.trading_state_cache.get("positions", [])
+            )
+
+        for pos in cached_positions:
+            if pos.get("status") == "closed":
+                pos["event_kind"] = "closed_position"
+                if symbol and pos.get("symbol") != symbol:
+                    continue
+                history.append(pos)
+    except Exception as e:
+        logger.debug(f"Failed to get cached positions for history: {e}")
+
+    # Get recent order decisions
+    try:
+        from hean.api import main as api_main
+
+        async with api_main.trading_state_lock:
+            recent_decisions = list(
+                api_main.trading_state_cache.get("order_decisions", [])
+            )
+
+        for dec in recent_decisions[-limit:]:
+            dec["event_kind"] = "decision"
+            if symbol and dec.get("symbol") != symbol:
+                continue
+            history.append(dec)
+    except Exception as e:
+        logger.debug(f"Failed to get decisions for history: {e}")
+
+    # Sort by timestamp (most recent first)
+    def sort_key(item: dict) -> str:
+        return (
+            item.get("timestamp")
+            or item.get("closed_at")
+            or item.get("created_at")
+            or item.get("updated_at")
+            or ""
+        )
+
+    history.sort(key=sort_key, reverse=True)
+    history = history[:limit]
+
+    return {
+        "history": history,
+        "count": len(history),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @why_router.get("/equity-history")

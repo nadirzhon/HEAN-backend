@@ -2,9 +2,16 @@
 
 Monitors API latency, system load, memory usage, and Python GC performance.
 If Python's Garbage Collector is slowing down execution, triggers C++ Emergency Takeover.
+
+BUG FIX (Bug #11): gc.collect() was called synchronously on the event loop every
+30 seconds, blocking it for 3+ seconds on large heaps.  This ironically CAUSED
+the latency it was supposed to detect.  Now runs gc.collect() in a thread pool
+executor.  Also added recovery logic so emergency_takeover can deactivate when
+conditions improve, instead of being permanent until restart.
 """
 
 import asyncio
+import concurrent.futures
 import gc
 import os
 import time
@@ -85,6 +92,14 @@ class SelfHealingMiddleware:
         # Emergency takeover state
         self._emergency_takeover_active = False
         self._cpp_emergency_handler: Any | None = None  # Would be C++ module
+        # Track consecutive healthy GC checks for recovery
+        self._consecutive_healthy_gc: int = 0
+        self._gc_recovery_threshold: int = 3  # 3 consecutive healthy checks to recover
+
+        # Thread pool for running gc.collect() off the event loop
+        self._gc_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="GC-Monitor"
+        )
 
         # Health status
         self._health_status = "healthy"
@@ -105,6 +120,7 @@ class SelfHealingMiddleware:
     async def stop(self) -> None:
         """Stop monitoring and cleanup."""
         self._emergency_takeover_active = False
+        self._gc_executor.shutdown(wait=False)
         logger.info("Self-healing middleware stopped")
 
     async def _monitoring_loop(self) -> None:
@@ -134,20 +150,54 @@ class SelfHealingMiddleware:
                 logger.error(f"Error in monitoring loop: {e}", exc_info=True)
 
     async def _gc_monitoring_loop(self) -> None:
-        """GC performance monitoring loop."""
+        """GC performance monitoring loop.
+
+        BUG FIX: Added recovery logic.  Previously, once emergency_takeover was
+        triggered it stayed active forever until process restart.  Now tracks
+        consecutive healthy GC checks and deactivates emergency takeover after
+        _gc_recovery_threshold consecutive healthy checks.
+        """
         while True:
             try:
                 await asyncio.sleep(self._gc_check_interval_seconds)
 
-                # Measure GC performance
+                # Measure GC performance (runs in thread pool, non-blocking)
                 gc_time = await self._measure_gc_performance()
 
                 # Check if GC is slowing execution
                 if gc_time > self._max_gc_time_ms:
+                    self._consecutive_healthy_gc = 0
                     logger.warning(
                         f"GC performance degraded: {gc_time:.2f}ms > {self._max_gc_time_ms}ms"
                     )
                     await self._handle_gc_slowdown()
+                else:
+                    self._consecutive_healthy_gc += 1
+                    # Recovery: if GC has been healthy for enough consecutive
+                    # checks, deactivate emergency takeover.
+                    if (
+                        self._emergency_takeover_active
+                        and self._consecutive_healthy_gc >= self._gc_recovery_threshold
+                    ):
+                        logger.info(
+                            "[SelfHealing] GC recovered: %d consecutive healthy checks "
+                            "(each < %.0fms). Deactivating emergency takeover.",
+                            self._consecutive_healthy_gc,
+                            self._max_gc_time_ms,
+                        )
+                        self._emergency_takeover_active = False
+                        await self._bus.publish(
+                            Event(
+                                event_type=EventType.REGIME_UPDATE,
+                                data={
+                                    "symbol": "GLOBAL",
+                                    "health_event": "emergency_takeover_recovered",
+                                    "reason": "gc_recovered",
+                                    "status": "healthy",
+                                    "active": False,
+                                }
+                            )
+                        )
 
             except asyncio.CancelledError:
                 break
@@ -237,16 +287,27 @@ class SelfHealingMiddleware:
     async def _measure_gc_performance(self) -> float:
         """Measure GC collection performance.
 
+        BUG FIX: gc.collect() is a blocking call that can take 3+ seconds on
+        large heaps.  Running it directly on the asyncio event loop was ironically
+        CAUSING the high-latency conditions that triggered emergency takeover.
+        Now runs in a dedicated thread pool executor so the event loop stays
+        responsive during garbage collection.
+
         Returns:
             GC collection time in milliseconds
         """
-        start_time = time.perf_counter()
+        def _gc_in_thread() -> tuple[int, float]:
+            """Run gc.collect() in a background thread."""
+            start_time = time.perf_counter()
+            collected = gc.collect()
+            end_time = time.perf_counter()
+            gc_time_ms = (end_time - start_time) * 1000.0
+            return collected, gc_time_ms
 
-        # Force a GC collection
-        collected = gc.collect()
-
-        end_time = time.perf_counter()
-        gc_time_ms = (end_time - start_time) * 1000.0
+        loop = asyncio.get_running_loop()
+        collected, gc_time_ms = await loop.run_in_executor(
+            self._gc_executor, _gc_in_thread
+        )
 
         # Track GC time
         self._gc_collection_times.append(gc_time_ms)
@@ -389,20 +450,32 @@ class SelfHealingMiddleware:
         )
 
     async def _update_health_status(self) -> None:
-        """Update overall health status."""
+        """Update overall health status.
+
+        BUG FIX: Previously checked max() of entire deque history, meaning a
+        single GC spike from 30 minutes ago would permanently mark the system
+        as degraded.  Now uses only the most recent 5 samples for each metric
+        to reflect current conditions, not historical worst-case.
+        """
         health_issues = []
 
-        # Check all metrics
-        if len(self._cpu_history) > 0 and max(self._cpu_history) > self._max_cpu_percent:
+        # Use recent samples (last 5) instead of entire history to avoid
+        # stale spikes from permanently degrading the health assessment.
+        recent_cpu = list(self._cpu_history)[-5:] if self._cpu_history else []
+        recent_memory = list(self._memory_history)[-5:] if self._memory_history else []
+        recent_api = list(self._api_latencies)[-5:] if self._api_latencies else []
+        recent_gc = list(self._gc_collection_times)[-5:] if self._gc_collection_times else []
+
+        if recent_cpu and max(recent_cpu) > self._max_cpu_percent:
             health_issues.append("high_cpu")
 
-        if len(self._memory_history) > 0 and max(self._memory_history) > self._max_memory_percent:
+        if recent_memory and max(recent_memory) > self._max_memory_percent:
             health_issues.append("high_memory")
 
-        if len(self._api_latencies) > 0 and max(self._api_latencies) > self._max_api_latency_ms:
+        if recent_api and max(recent_api) > self._max_api_latency_ms:
             health_issues.append("high_api_latency")
 
-        if len(self._gc_collection_times) > 0 and max(self._gc_collection_times) > self._max_gc_time_ms:
+        if recent_gc and max(recent_gc) > self._max_gc_time_ms:
             health_issues.append("gc_slowdown")
 
         # Update status

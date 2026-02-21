@@ -10,16 +10,30 @@ BUG FIX (2026-01):
 - Fixed drawdown calculation to use high water mark (peak equity) instead of initial capital
 - This prevents blocking trading when in profit but experiencing a pullback
 - Added proper peak tracking for accurate drawdown measurement
+
+BUG FIX (2026-02-21):
+- Fixed constructor to accept accounting and killswitch parameters (main.py passes these)
+- Added start()/stop() lifecycle methods with EQUITY_UPDATE subscription
+- Added is_trading_allowed() method
+- Governor now auto-syncs equity from EQUITY_UPDATE events instead of requiring
+  manual check_and_update() calls, fixing the equity desynchronization between
+  engine/status and risk/status endpoints
 """
+
+from __future__ import annotations
 
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from hean.config import settings
 from hean.core.bus import EventBus
 from hean.core.types import Event, EventType
 from hean.logging import get_logger
+
+if TYPE_CHECKING:
+    from hean.portfolio.accounting import PortfolioAccounting
+    from hean.risk.killswitch import KillSwitch
 
 logger = get_logger(__name__)
 
@@ -37,15 +51,29 @@ class RiskGovernor:
 
     Provides graduated risk management with clear thresholds,
     recommendations, and clear paths back to normal operation.
+
+    Subscribes to EQUITY_UPDATE events to keep equity synced with the
+    engine's accounting module, preventing the desync where risk/status
+    would show initial_capital while engine/status showed current equity.
     """
 
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        accounting: PortfolioAccounting | None = None,
+        killswitch: KillSwitch | None = None,
+    ) -> None:
         """Initialize risk governor.
 
         Args:
             bus: Event bus for publishing state changes
+            accounting: Portfolio accounting for equity lookups (optional,
+                        equity can also be received via EQUITY_UPDATE events)
+            killswitch: KillSwitch instance for coordinated risk checks
         """
         self._bus = bus
+        self._accounting = accounting
+        self._killswitch = killswitch
         self._enabled = getattr(settings, "risk_governor_enabled", True)
         self._state = RiskState.NORMAL
         self._level = 0  # 0=NORMAL, 1=SOFT_BRAKE, 2=QUARANTINE, 3=HARD_STOP
@@ -57,9 +85,6 @@ class RiskGovernor:
         self._quarantined_symbols: set[str] = set()
 
         # High Water Mark tracking for accurate drawdown calculation
-        # BUG FIX: Previously calculated drawdown from initial_capital, which
-        # caused issues when in profit - a pullback from profit could be
-        # misinterpreted or the state wouldn't properly track recovery
         self._peak_equity: float = 0.0  # Track highest equity reached
         self._initial_capital: float = 0.0  # Store initial capital
         self._last_equity: float = 0.0  # Last known equity
@@ -68,7 +93,134 @@ class RiskGovernor:
         self._current_drawdown_pct: float = 0.0
         self._max_drawdown_pct: float = 0.0
 
-        logger.info(f"Risk Governor initialized: enabled={self._enabled}")
+        self._running = False
+
+        # Seed initial capital from accounting if available
+        if self._accounting is not None:
+            try:
+                ic = self._accounting.initial_capital
+                if ic and ic > 0:
+                    self._initial_capital = ic
+                    eq = self._accounting.get_equity()
+                    self._peak_equity = max(ic, eq)
+                    self._last_equity = eq
+            except Exception:
+                pass  # Accounting might not be ready yet
+
+        logger.info(
+            f"Risk Governor initialized: enabled={self._enabled}, "
+            f"initial_capital={self._initial_capital:.2f}"
+        )
+
+    async def start(self) -> None:
+        """Start risk governor -- subscribe to equity updates.
+
+        This ensures the governor's equity tracking stays synchronized
+        with the engine's accounting module via event-driven updates.
+        """
+        self._running = True
+
+        # Subscribe to EQUITY_UPDATE to keep equity synced
+        self._bus.subscribe(EventType.EQUITY_UPDATE, self._on_equity_update)
+
+        # Also subscribe to position events for immediate risk reassessment
+        self._bus.subscribe(EventType.POSITION_OPENED, self._on_position_event)
+        self._bus.subscribe(EventType.POSITION_CLOSED, self._on_position_event)
+
+        # Initialize from accounting if we haven't yet
+        if self._accounting is not None and self._initial_capital == 0.0:
+            try:
+                ic = self._accounting.initial_capital
+                if ic and ic > 0:
+                    self._initial_capital = ic
+                    eq = self._accounting.get_equity()
+                    self._peak_equity = max(ic, eq)
+                    self._last_equity = eq
+                    logger.info(
+                        f"[RiskGovernor] Seeded from accounting: "
+                        f"initial_capital={ic:.2f}, equity={eq:.2f}"
+                    )
+            except Exception as e:
+                logger.warning(f"[RiskGovernor] Failed to seed from accounting: {e}")
+
+        logger.info("[RiskGovernor] Started -- subscribed to EQUITY_UPDATE events")
+
+    async def stop(self) -> None:
+        """Stop risk governor -- unsubscribe from events."""
+        self._running = False
+        self._bus.unsubscribe(EventType.EQUITY_UPDATE, self._on_equity_update)
+        self._bus.unsubscribe(EventType.POSITION_OPENED, self._on_position_event)
+        self._bus.unsubscribe(EventType.POSITION_CLOSED, self._on_position_event)
+        logger.info("[RiskGovernor] Stopped")
+
+    async def _on_equity_update(self, event: Event) -> None:
+        """Handle EQUITY_UPDATE events to keep equity synced.
+
+        This is the primary mechanism for keeping the governor's equity
+        tracking in sync with the engine. Without this, the governor
+        would show initial_capital (502.40) while the engine shows
+        current equity (518.89).
+        """
+        if not self._running:
+            return
+
+        data = event.data
+        equity = data.get("equity", 0.0)
+        if equity <= 0:
+            return
+
+        # Get initial capital from accounting if not yet set
+        initial_capital = self._initial_capital
+        if initial_capital == 0.0 and self._accounting is not None:
+            try:
+                initial_capital = self._accounting.initial_capital
+                self._initial_capital = initial_capital
+            except Exception:
+                initial_capital = equity  # Fallback
+
+        # Get position/order counts from accounting
+        positions_count = 0
+        orders_count = 0
+        if self._accounting is not None:
+            try:
+                positions_count = len(self._accounting.get_positions())
+            except Exception:
+                pass
+
+        # Run the full risk check with fresh equity data
+        await self.check_and_update(
+            equity=equity,
+            initial_capital=initial_capital,
+            positions_count=positions_count,
+            orders_count=orders_count,
+        )
+
+    async def _on_position_event(self, event: Event) -> None:
+        """Handle position open/close events for immediate risk reassessment."""
+        if not self._running or self._accounting is None:
+            return
+
+        try:
+            equity = self._accounting.get_equity()
+            initial_capital = self._initial_capital or self._accounting.initial_capital
+            positions_count = len(self._accounting.get_positions())
+
+            await self.check_and_update(
+                equity=equity,
+                initial_capital=initial_capital,
+                positions_count=positions_count,
+                orders_count=0,
+            )
+        except Exception as e:
+            logger.debug(f"[RiskGovernor] Position event risk check failed: {e}")
+
+    def is_trading_allowed(self) -> bool:
+        """Check if trading is globally allowed based on risk state.
+
+        Returns:
+            True if trading is allowed (not in HARD_STOP)
+        """
+        return self._state != RiskState.HARD_STOP
 
     def get_state(self) -> dict[str, Any]:
         """Get current risk governor state.
@@ -135,7 +287,7 @@ class RiskGovernor:
             old_peak = self._peak_equity
             self._peak_equity = equity
             logger.debug(
-                f"[RiskGovernor] New peak equity: {old_peak:.2f} → {equity:.2f}"
+                f"[RiskGovernor] New peak equity: {old_peak:.2f} -> {equity:.2f}"
             )
 
         self._last_equity = equity
@@ -167,7 +319,9 @@ class RiskGovernor:
             # We're in loss vs initial capital
             # Use the larger drawdown for safety
             drawdown_pct = max(drawdown_from_initial, drawdown_from_peak)
-            drawdown_source = "initial" if drawdown_from_initial >= drawdown_from_peak else "peak"
+            drawdown_source = (
+                "initial" if drawdown_from_initial >= drawdown_from_peak else "peak"
+            )
 
         # Track max drawdown
         if drawdown_pct > self._max_drawdown_pct:
@@ -260,12 +414,14 @@ class RiskGovernor:
             logger.info(f"All symbol quarantines cleared: {count} symbols")
             return {"status": "cleared_all", "count": count}
 
-    async def clear_all(self, force: bool = False, reset_peak: bool = False) -> dict[str, Any]:
+    async def clear_all(
+        self, force: bool = False, reset_peak: bool = False
+    ) -> dict[str, Any]:
         """Clear all risk governor blocks.
 
         Args:
             force: Force clear even if conditions not met
-            reset_peak: Also reset peak equity to current equity (useful after manual intervention)
+            reset_peak: Also reset peak equity to current equity
 
         Returns:
             Status dictionary
@@ -295,10 +451,14 @@ class RiskGovernor:
             self._max_drawdown_pct = 0.0
             self._current_drawdown_pct = 0.0
             logger.info(
-                f"[RiskGovernor] Peak equity reset: {old_peak:.2f} → {self._peak_equity:.2f}"
+                f"[RiskGovernor] Peak equity reset: {old_peak:.2f} -> "
+                f"{self._peak_equity:.2f}"
             )
 
-        logger.info(f"Risk Governor cleared: {old_state.value} → NORMAL (force={force}, reset_peak={reset_peak})")
+        logger.info(
+            f"Risk Governor cleared: {old_state.value} -> NORMAL "
+            f"(force={force}, reset_peak={reset_peak})"
+        )
 
         await self._bus.publish(Event(
             event_type=EventType.KILLSWITCH_TRIGGERED,  # Reuse
@@ -344,7 +504,10 @@ class RiskGovernor:
         self._max_drawdown_pct = 0.0
         self._current_drawdown_pct = 0.0
 
-        logger.info(f"[RiskGovernor] Peak equity manually reset: {old_peak:.2f} → {self._peak_equity:.2f}")
+        logger.info(
+            f"[RiskGovernor] Peak equity manually reset: "
+            f"{old_peak:.2f} -> {self._peak_equity:.2f}"
+        )
 
         return {
             "status": "reset",
@@ -367,7 +530,12 @@ class RiskGovernor:
             return False
         return True
 
-    async def check_signal_allowed(self, symbol: str, strategy_id: str, signal_metadata: dict | None = None) -> bool:
+    async def check_signal_allowed(
+        self,
+        symbol: str,
+        strategy_id: str,
+        signal_metadata: dict | None = None,
+    ) -> bool:
         """Check if signal is allowed and publish RISK_BLOCKED if not.
 
         This method should be called by TradingSystem when processing signals.
@@ -407,7 +575,9 @@ class RiskGovernor:
                 }
             ))
 
-            logger.info(f"[RiskGovernor] Signal blocked: {strategy_id}/{symbol} - {details}")
+            logger.info(
+                f"[RiskGovernor] Signal blocked: {strategy_id}/{symbol} - {details}"
+            )
             return False
 
         return True
@@ -496,7 +666,9 @@ class RiskGovernor:
             })
         elif regime_upper == "RANGE":
             recommendations.update({
-                "preferred_strategies": ["mean_reversion", "range_trading", "market_making"],
+                "preferred_strategies": [
+                    "mean_reversion", "range_trading", "market_making",
+                ],
                 "avoid_strategies": ["momentum", "breakout"],
                 "stop_loss_adjustment": "wider",  # Allow for noise
                 "take_profit_adjustment": "conservative",  # Take quick profits
@@ -543,7 +715,7 @@ class RiskGovernor:
         self._blocked_at = datetime.utcnow()
 
         logger.warning(
-            f"Risk Governor escalated: {old_state.value} → {new_state.value}, "
+            f"Risk Governor escalated: {old_state.value} -> {new_state.value}, "
             f"reason={reason_codes}, {metric}={value:.2f} >= {threshold:.2f}"
         )
 
@@ -580,7 +752,9 @@ class RiskGovernor:
             self._threshold = None
             self._blocked_at = None
 
-        logger.info(f"Risk Governor de-escalated: {old_state.value} → {new_state.value}")
+        logger.info(
+            f"Risk Governor de-escalated: {old_state.value} -> {new_state.value}"
+        )
 
         await self._bus.publish(Event(
             event_type=EventType.KILLSWITCH_TRIGGERED,  # Reuse
@@ -636,7 +810,9 @@ class RiskGovernor:
         elif self._state == RiskState.QUARANTINE:
             return "Review quarantined symbols. Consider manual intervention."
         elif self._state == RiskState.HARD_STOP:
-            return "EMERGENCY: Close all positions. Review strategy before resuming."
+            return (
+                "EMERGENCY: Close all positions. Review strategy before resuming."
+            )
         return "Unknown state"
 
     def _get_clear_rule(self) -> str:
@@ -650,7 +826,13 @@ class RiskGovernor:
         elif self._state == RiskState.SOFT_BRAKE:
             return "Drawdown must reduce to <5% and wait 30 minutes"
         elif self._state == RiskState.QUARANTINE:
-            return "Drawdown must reduce to <5% and wait 30 minutes, or manually clear quarantined symbols"
+            return (
+                "Drawdown must reduce to <5% and wait 30 minutes, "
+                "or manually clear quarantined symbols"
+            )
         elif self._state == RiskState.HARD_STOP:
-            return "Drawdown must reduce to <5% and wait 1 hour, or force clear with confirmation"
+            return (
+                "Drawdown must reduce to <5% and wait 1 hour, "
+                "or force clear with confirmation"
+            )
         return "Unknown state"

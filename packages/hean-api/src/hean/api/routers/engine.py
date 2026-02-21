@@ -237,6 +237,27 @@ async def kill_engine(request: Request) -> dict:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@router.post("/reset-halt")
+async def reset_reconciler_halt(request: Request) -> dict:
+    """Reset EMERGENCY HALT from position reconciler.
+
+    Clears the consecutive drift counter and stop_trading flag,
+    allowing trading to resume after investigating the root cause.
+    """
+    engine_facade = _get_facade(request)
+    try:
+        await _log_control_event("reset_halt", "command", request, detail="engine/reset-halt")
+        result = await engine_facade.reset_reconciler_halt()
+        await _log_control_event(
+            "reset_halt", "result", request, success=True, extra={"result": result}
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Failed to reset halt: {e}", exc_info=True)
+        await _log_control_event("reset_halt", "result", request, success=False, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.post("/restart")
 async def restart_engine(request: Request) -> dict:
     """Restart the engine (stop then start)."""

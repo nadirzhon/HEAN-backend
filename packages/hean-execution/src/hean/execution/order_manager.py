@@ -1,12 +1,25 @@
 """Order lifecycle management."""
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 
-from hean.core.types import Order, OrderStatus
+from hean.core.types import Order, OrderRequest, OrderStatus
 from hean.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class PendingPlacement:
+    """Tracks an order placement in-flight (before Bybit responds).
+
+    This solves the race condition where WebSocket fills arrive before
+    the HTTP response from place_order, causing OrderManager lookups to fail.
+    """
+
+    order_request: OrderRequest
+    placed_at: datetime
 
 
 class OrderManager:
@@ -18,11 +31,58 @@ class OrderManager:
         self._orders_by_strategy: dict[str, list[str]] = defaultdict(list)
         self._orders_by_symbol: dict[str, list[str]] = defaultdict(list)
 
+        # Pre-registration for in-flight orders (race condition protection).
+        # Key: symbol (e.g. "BTCUSDT"). Stores the most recent pending placement.
+        self._pending_placements: dict[str, PendingPlacement] = {}
+
+    def pre_register_placement(self, order_request: OrderRequest) -> None:
+        """Pre-register an order placement BEFORE the HTTP call to Bybit.
+
+        This prevents the race condition where a WebSocket fill arrives before
+        the HTTP response, causing OrderManager.get_order() to fail.
+        The pending placement stores strategy_id, symbol, side, etc. so that
+        the ORDER_FILLED handler can use it as a fallback.
+
+        Args:
+            order_request: The order request about to be sent to Bybit
+        """
+        self._pending_placements[order_request.symbol] = PendingPlacement(
+            order_request=order_request,
+            placed_at=datetime.utcnow(),
+        )
+        logger.debug(
+            f"Pre-registered pending placement: {order_request.symbol} "
+            f"{order_request.side} strategy={order_request.strategy_id}"
+        )
+
+    def consume_pending_placement(self, symbol: str) -> PendingPlacement | None:
+        """Consume (pop) a pending placement for a symbol.
+
+        Returns the pending placement if one exists, removing it from the registry.
+        Used by ORDER_FILLED handler as fallback when order_id lookup fails.
+
+        Args:
+            symbol: Trading symbol to look up
+
+        Returns:
+            PendingPlacement if found, None otherwise
+        """
+        placement = self._pending_placements.pop(symbol, None)
+        if placement:
+            # Only return if recent (within 30 seconds)
+            age = (datetime.utcnow() - placement.placed_at).total_seconds()
+            if age <= 30.0:
+                return placement
+            logger.debug(f"Stale pending placement for {symbol} (age={age:.1f}s), discarding")
+        return None
+
     def register_order(self, order: Order) -> None:
         """Register a new order."""
         self._orders[order.order_id] = order
         self._orders_by_strategy[order.strategy_id].append(order.order_id)
         self._orders_by_symbol[order.symbol].append(order.order_id)
+        # Clear any pending placement for this symbol (HTTP response arrived)
+        self._pending_placements.pop(order.symbol, None)
         logger.debug(f"Registered order {order.order_id}")
 
     def get_order(self, order_id: str) -> Order | None:

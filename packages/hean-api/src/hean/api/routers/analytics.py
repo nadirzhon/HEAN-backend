@@ -105,14 +105,23 @@ async def get_analytics_summary(request: Request) -> AnalyticsSummary:
 async def get_blocked_signals_analytics() -> BlockedSignalsAnalytics:
     """Get blocked signals analytics."""
     try:
-        # Get data from no_trade_report
-        report_data = no_trade_report.get_summary()
+        # Get data from no_trade_report (returns a NoTradeSummary dataclass)
+        summary = no_trade_report.get_summary()
+
+        # Total blocks = sum of all reason counts
+        total_blocks = sum(summary.totals.values()) if summary.totals else 0
+
+        # Top reasons sorted by count descending
+        top_reasons = [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(summary.totals.items(), key=lambda x: x[1], reverse=True)
+        ]
 
         return BlockedSignalsAnalytics(
-            total_blocks=report_data.get("total_blocks", 0),
-            top_reasons=report_data.get("top_reasons", []),
-            blocks_by_hour=report_data.get("blocks_by_hour", {}),
-            recent_blocks=report_data.get("recent_blocks", []),
+            total_blocks=total_blocks,
+            top_reasons=top_reasons,
+            blocks_by_hour={},
+            recent_blocks=[],
         )
     except Exception as e:
         logger.error(f"Failed to get blocked signals analytics: {e}", exc_info=True)
@@ -296,18 +305,47 @@ async def get_correlation_matrix(request: Request) -> dict[str, Any]:
         # Get correlation engine from trading system
         trading_system = engine_facade._trading_system
         if not trading_system or not hasattr(trading_system, '_correlation_engine'):
-            return {"correlation_matrix": {}, "symbols": []}
+            return {
+                "correlation_matrix": {},
+                "symbols": [],
+                "insufficient_data": True,
+                "reason": "Correlation engine not initialized",
+                "min_data_points": 50,
+                "message": (
+                    "Correlation engine is not available. "
+                    "Ensure phase5_correlation_engine_enabled=true and the engine is running."
+                ),
+            }
 
         correlation_engine = trading_system._correlation_engine
         if correlation_engine is None:
-            return {"correlation_matrix": {}, "symbols": []}
+            return {
+                "correlation_matrix": {},
+                "symbols": [],
+                "insufficient_data": True,
+                "reason": "Correlation engine is None",
+                "min_data_points": 50,
+                "message": "Correlation engine instance is not created.",
+            }
+
+        # Check data sufficiency: correlation requires >= 50 returns per symbol
+        min_required = 50
+        symbols_with_data = {
+            sym: len(returns)
+            for sym, returns in correlation_engine._returns_history.items()
+            if len(returns) > 0
+        }
+        symbols_ready = {
+            sym: count for sym, count in symbols_with_data.items()
+            if count >= min_required
+        }
 
         # Get correlation matrix
         matrix = correlation_engine.get_correlation_matrix()
 
         # Format for UI: convert tuple keys to string keys
         formatted_matrix: dict[str, float] = {}
-        symbols = set()
+        symbols: set[str] = set()
 
         for (symbol_a, symbol_b), correlation in matrix.items():
             key = f"{symbol_a}:{symbol_b}"
@@ -315,11 +353,48 @@ async def get_correlation_matrix(request: Request) -> dict[str, Any]:
             symbols.add(symbol_a)
             symbols.add(symbol_b)
 
+        # Determine if data is sufficient
+        has_data = len(formatted_matrix) > 0
+        all_zero = has_data and all(v == 0.0 for v in formatted_matrix.values())
+
+        if not has_data or all_zero:
+            # Compute progress info for the frontend
+            max_data_points = max(symbols_with_data.values()) if symbols_with_data else 0
+            progress_pct = round(min(max_data_points / min_required, 1.0) * 100, 1)
+
+            return {
+                "correlation_matrix": formatted_matrix,
+                "symbols": sorted(symbols) if symbols else sorted(correlation_engine._symbols),
+                "insufficient_data": True,
+                "reason": (
+                    "Not enough price history to compute correlations"
+                    if not has_data
+                    else "All correlations are zero - still collecting returns data"
+                ),
+                "min_data_points": min_required,
+                "symbols_tracking": len(symbols_with_data),
+                "symbols_ready": len(symbols_ready),
+                "max_data_points_collected": max_data_points,
+                "progress_pct": progress_pct,
+                "message": (
+                    f"Need {min_required} price returns per symbol. "
+                    f"Currently {len(symbols_ready)}/{len(symbols_with_data)} symbols ready "
+                    f"(best: {max_data_points}/{min_required} data points, "
+                    f"{progress_pct}% complete). "
+                    "Correlations will appear automatically once sufficient data is collected."
+                ),
+                "min_correlation": 0.7,
+                "threshold": 0.7,
+            }
+
         return {
             "correlation_matrix": formatted_matrix,
             "symbols": sorted(symbols),
-            "min_correlation": 0.7,  # From config
-            "threshold": 0.7
+            "insufficient_data": False,
+            "pairs_computed": len(formatted_matrix) // 2,
+            "symbols_ready": len(symbols_ready),
+            "min_correlation": 0.7,
+            "threshold": 0.7,
         }
     except Exception as e:
         logger.error(f"Failed to get correlation matrix: {e}", exc_info=True)

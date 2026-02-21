@@ -168,6 +168,12 @@ class TradingSystem:
         # ARCHON — Brain-Orchestrator
         self._archon: Any = None  # TYPE_CHECKING import to avoid circular dependency
 
+        # Advanced Intelligence Modules (Graph Engine, Causal Inference, Meta-Learning, Swarm)
+        self._graph_engine: Any = None
+        self._causal_inference_engine: Any = None
+        self._meta_learning_engine: Any = None
+        self._multimodal_swarm: Any = None
+
         # Phase 5: Statistical Arbitrage & Anti-Fragile Architecture
         self._correlation_engine: CorrelationEngine | None = None
         self._safety_net: GlobalSafetyNet | None = None
@@ -1251,6 +1257,81 @@ class TradingSystem:
             self._fabric_registry = CausalRegistry(maxsize=20_000)
             self._fabric_eev = EEVScorer()
             logger.info("Temporal Event Fabric enabled (DNA tracking + EEV scoring)")
+
+        # Graph Engine (C++ with Python fallback)
+        if getattr(settings, 'graph_engine_enabled', False):
+            try:
+                from hean.core.intelligence.graph_engine import GraphEngineWrapper
+
+                self._graph_engine = GraphEngineWrapper(
+                    bus=self._bus,
+                    symbols=list(settings.trading_symbols),
+                )
+                await self._graph_engine.start()
+                logger.info("Graph Engine started (C++ or Python fallback)")
+            except Exception as e:
+                logger.warning(f"Could not start Graph Engine: {e}")
+                self._graph_engine = None
+
+        # Causal Inference Engine
+        if getattr(settings, 'causal_inference_enabled', False):
+            try:
+                from hean.core.intelligence.causal_inference_engine import (
+                    CausalInferenceEngine,
+                )
+
+                self._causal_inference_engine = CausalInferenceEngine(
+                    bus=self._bus,
+                    target_symbols=list(settings.trading_symbols),
+                )
+                await self._causal_inference_engine.start()
+                logger.info("Causal Inference Engine started")
+            except Exception as e:
+                logger.warning(f"Could not start Causal Inference Engine: {e}")
+                self._causal_inference_engine = None
+
+        # Meta-Learning Engine
+        if getattr(settings, 'absolute_plus_enabled', False):
+            try:
+                from hean.core.intelligence.meta_learning_engine import (
+                    MetaLearningEngine,
+                )
+                from pathlib import Path as _Path
+
+                # cpp_source_dir: look for C++ sources relative to project root
+                _cpp_dir = _Path(__file__).resolve().parents[4] / "cpp"
+                if not _cpp_dir.exists():
+                    _cpp_dir = _Path(".")  # fallback
+
+                self._meta_learning_engine = MetaLearningEngine(
+                    bus=self._bus,
+                    cpp_source_dir=_cpp_dir,
+                    auto_patch_enabled=settings.meta_learning_auto_patch,
+                    simulation_rate=settings.meta_learning_rate,
+                    max_concurrent_simulations=settings.meta_learning_max_workers or 4,
+                )
+                await self._meta_learning_engine.start()
+                logger.info("Meta-Learning Engine started")
+            except Exception as e:
+                logger.warning(f"Could not start Meta-Learning Engine: {e}")
+                self._meta_learning_engine = None
+
+        # Multimodal Swarm Intelligence
+        if getattr(settings, 'multimodal_swarm_enabled', False):
+            try:
+                from hean.core.intelligence.multimodal_swarm import (
+                    MultimodalSwarm,
+                )
+
+                self._multimodal_swarm = MultimodalSwarm(
+                    bus=self._bus,
+                    symbols=list(settings.trading_symbols),
+                )
+                await self._multimodal_swarm.start()
+                logger.info("Multimodal Swarm started")
+            except Exception as e:
+                logger.warning(f"Could not start Multimodal Swarm: {e}")
+                self._multimodal_swarm = None
 
         # ARCHON — Central Brain-Orchestrator
         if settings.archon_enabled:
@@ -2589,24 +2670,66 @@ class TradingSystem:
             if order_id:
                 # Try order_manager first to get strategy_id/symbol
                 managed = self._order_manager.get_order(order_id)
+
+                # RACE CONDITION FIX: If OrderManager lookup fails, the fill
+                # likely arrived via WebSocket before place_order() returned.
+                # Fall back to the pre-registered pending placement for this symbol.
+                pending = None
+                fill_symbol = event.data.get("symbol", "UNKNOWN")
+                if not managed and fill_symbol != "UNKNOWN":
+                    pending = self._order_manager.consume_pending_placement(fill_symbol)
+                    if pending:
+                        logger.info(
+                            f"[ORDER_FILLED_HANDLER] OrderManager miss for {order_id}, "
+                            f"using pending placement: {fill_symbol} "
+                            f"strategy={pending.order_request.strategy_id}"
+                        )
+
+                # Determine source: managed order > pending placement > event data
+                req = pending.order_request if pending else None
+                strategy_id = (
+                    managed.strategy_id if managed
+                    else req.strategy_id if req
+                    else event.data.get("strategy_id", "unknown")
+                )
+                symbol = (
+                    managed.symbol if managed
+                    else req.symbol if req
+                    else fill_symbol
+                )
+                side = (
+                    managed.side if managed
+                    else req.side if req
+                    else event.data.get("side", "buy")
+                ).lower()
+                size = fill_size_raw or (
+                    managed.size if managed
+                    else req.size if req
+                    else 0.0
+                )
+
                 # Always construct a FILLED order with actual fill data
                 order = Order(
                     order_id=order_id,
-                    strategy_id=managed.strategy_id if managed else event.data.get("strategy_id", "unknown"),
-                    symbol=managed.symbol if managed else event.data.get("symbol", "UNKNOWN"),
-                    side=(managed.side if managed else event.data.get("side", "buy")).lower(),
-                    size=fill_size_raw or (managed.size if managed else 0.0),
-                    filled_size=fill_size_raw or (managed.size if managed else 0.0),
+                    strategy_id=strategy_id,
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    filled_size=fill_size_raw or size,
                     price=fill_price_raw,
                     avg_fill_price=fill_price_raw,
-                    order_type=managed.order_type if managed else "limit",
+                    order_type=managed.order_type if managed else "market",
                     status=OrderStatus.FILLED,
                     timestamp=datetime.utcnow(),
-                    stop_loss=managed.stop_loss if managed else None,
-                    take_profit=managed.take_profit if managed else None,
-                    metadata=managed.metadata if managed else event.data.get("metadata", {}),
+                    stop_loss=managed.stop_loss if managed else (req.stop_loss if req else None),
+                    take_profit=managed.take_profit if managed else (req.take_profit if req else None),
+                    metadata=managed.metadata if managed else (req.metadata if req else event.data.get("metadata", {})),
                 )
                 logger.info(f"[ORDER_FILLED_HANDLER] Built filled order: {order_id} {order.side} {order.filled_size} {order.symbol} @ {fill_price_raw}")
+
+                # Also register this order in OrderManager so future lookups succeed
+                if not managed:
+                    self._order_manager.register_order(order)
             else:
                 logger.warning(f"[ORDER_FILLED_HANDLER] Missing order_id in event data: {event.data}")
                 return
@@ -3044,6 +3167,32 @@ class TradingSystem:
 
         await self._emit_account_state()
         return {"closed_positions": len(closed_positions), "cancelled_orders": len(self._order_manager.get_open_orders())}
+
+    async def reset_reconciler_halt(self) -> dict[str, Any]:
+        """Reset the position reconciler EMERGENCY HALT state.
+
+        Resets the consecutive drift counter and orphan detection state,
+        allowing trading to resume. Also clears the stop_trading flag
+        if it was set by the reconciler.
+
+        Returns:
+            Dict with reset status information
+        """
+        result: dict[str, Any] = {"reconciler_reset": False, "stop_trading_cleared": False}
+
+        if self._position_reconciler:
+            recon_result = await self._position_reconciler.reset_halt()
+            result["reconciler_reset"] = True
+            result.update(recon_result)
+
+        # Also clear stop_trading flag if it was set by reconciler
+        if self._stop_trading:
+            self._stop_trading = False
+            result["stop_trading_cleared"] = True
+            logger.warning("[RESET] stop_trading flag cleared after reconciler halt reset")
+
+        logger.warning(f"[RESET] Reconciler halt reset: {result}")
+        return result
 
     async def reset_paper_state(self) -> dict[str, Any]:
         """Clear paper-trading state (positions, orders, cached decisions)."""

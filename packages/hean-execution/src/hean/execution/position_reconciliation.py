@@ -64,17 +64,54 @@ class PositionReconciler:
         self._reconciliation_task: asyncio.Task[None] | None = None
 
         # Configuration
-        self._reconciliation_interval = timedelta(seconds=30)  # Check every 30s
+        self._reconciliation_interval = timedelta(seconds=60)  # Check every 60s (was 30s)
         self._size_tolerance_pct = 0.02  # 2% relative tolerance for size mismatches
         self._size_tolerance_abs = 0.001  # Absolute tolerance (handles tiny positions)
         self._max_drift_before_halt = 10  # Halt after 10 unresolved drifts (was 3)
+        self._orphan_confirm_count = 3  # Require 3 consecutive detections before closing
 
         # State tracking
         self._consecutive_drifts = 0
+        self._halted = False
         self._start_time = datetime.utcnow()
         self._startup_grace_seconds = 120  # Don't close orphans in first 2 minutes
         self._last_reconciliation: ReconciliationResult | None = None
         self._reconciliation_history: list[ReconciliationResult] = []
+
+        # Per-symbol orphan tracking: symbol -> consecutive detection count.
+        # A position must be detected as orphaned N consecutive times before
+        # it gets closed. This prevents closing positions whose fills are
+        # still being processed (race condition with ORDER_FILLED).
+        self._orphan_detection_count: dict[str, int] = {}
+
+        # Recently-placed orders: symbol -> timestamp.
+        # Positions for symbols with recent order placements are never
+        # treated as orphans (grace period for fill processing).
+        self._recent_order_symbols: dict[str, datetime] = {}
+        self._order_grace_seconds = 120  # 2 minutes after order placement
+
+    def record_order_placed(self, symbol: str) -> None:
+        """Record that an order was placed for a symbol.
+
+        Prevents the reconciler from treating positions for this symbol as
+        orphans for a grace period, giving time for the fill to be processed.
+
+        Args:
+            symbol: Trading symbol (e.g. "BTCUSDT")
+        """
+        self._recent_order_symbols[symbol] = datetime.utcnow()
+
+    def _is_symbol_in_order_grace(self, symbol: str) -> bool:
+        """Check if a symbol is within the order placement grace period."""
+        placed_at = self._recent_order_symbols.get(symbol)
+        if not placed_at:
+            return False
+        elapsed = (datetime.utcnow() - placed_at).total_seconds()
+        if elapsed > self._order_grace_seconds:
+            # Expired -- clean up
+            self._recent_order_symbols.pop(symbol, None)
+            return False
+        return True
 
     async def start(self) -> None:
         """Start position reconciliation."""
@@ -82,12 +119,25 @@ class PositionReconciler:
             return
 
         self._running = True
+        self._halted = False
         self._reconciliation_task = asyncio.create_task(self._reconciliation_loop())
+
+        # Subscribe to ORDER_PLACED to track recently-placed orders
+        self._bus.subscribe(EventType.ORDER_PLACED, self._handle_order_placed)
         logger.info("Position reconciliation started")
+
+    async def _handle_order_placed(self, event: Event) -> None:
+        """Track order placements for grace period."""
+        order = event.data.get("order")
+        if order:
+            symbol = getattr(order, "symbol", None) or event.data.get("symbol", "")
+            if symbol:
+                self.record_order_placed(symbol)
 
     async def stop(self) -> None:
         """Stop position reconciliation."""
         self._running = False
+        self._bus.unsubscribe(EventType.ORDER_PLACED, self._handle_order_placed)
         if self._reconciliation_task:
             self._reconciliation_task.cancel()
             try:
@@ -256,15 +306,49 @@ class PositionReconciler:
         # Skip orphan cleanup during startup grace period (system may still be registering fills)
         elapsed = (datetime.utcnow() - self._start_time).total_seconds()
         if missing_locally and elapsed > self._startup_grace_seconds:
+            confirmed_orphans = []
             for symbol in missing_locally:
+                # Skip symbols with recent order placements (fill may still be processing)
+                if self._is_symbol_in_order_grace(symbol):
+                    logger.info(
+                        f"[Reconciler] Skipping orphan check for {symbol} — "
+                        f"recent order placement (grace period)"
+                    )
+                    actions.append(f"order_grace_skip:{symbol}")
+                    continue
+
+                # Require multiple consecutive detections before closing
+                count = self._orphan_detection_count.get(symbol, 0) + 1
+                self._orphan_detection_count[symbol] = count
+
+                if count >= self._orphan_confirm_count:
+                    confirmed_orphans.append(symbol)
+                    logger.warning(
+                        f"[Reconciler] {symbol} confirmed orphan after {count} consecutive detections"
+                    )
+                else:
+                    logger.info(
+                        f"[Reconciler] {symbol} orphan detection {count}/{self._orphan_confirm_count} "
+                        f"— waiting for confirmation"
+                    )
+                    actions.append(f"orphan_pending:{symbol}({count}/{self._orphan_confirm_count})")
+
+            for symbol in confirmed_orphans:
                 await self._close_orphaned_position(symbol)
-            actions.append(f"closed_orphans:{missing_locally}")
+                self._orphan_detection_count.pop(symbol, None)
+            if confirmed_orphans:
+                actions.append(f"closed_orphans:{confirmed_orphans}")
         elif missing_locally:
             logger.info(
                 f"Startup grace period ({int(self._startup_grace_seconds - elapsed)}s remaining): "
                 f"skipping orphan cleanup for {missing_locally}"
             )
             actions.append(f"grace_period_skip:{missing_locally}")
+
+        # Clear orphan detection count for symbols no longer missing
+        for symbol in list(self._orphan_detection_count.keys()):
+            if symbol not in missing_locally:
+                self._orphan_detection_count.pop(symbol, None)
 
         # Handle positions missing on exchange (ghost positions locally)
         # These can be auto-cleaned — MUST publish POSITION_CLOSED so downstream
@@ -381,6 +465,7 @@ class PositionReconciler:
 
     async def _trigger_emergency_halt(self) -> None:
         """Trigger emergency trading halt due to persistent drift."""
+        self._halted = True
         logger.error(
             f"EMERGENCY HALT: {self._consecutive_drifts} consecutive position drifts detected"
         )
@@ -403,7 +488,11 @@ class PositionReconciler:
         """Get current reconciliation status."""
         return {
             "running": self._running,
+            "halted": self._halted,
             "consecutive_drifts": self._consecutive_drifts,
+            "max_drift_before_halt": self._max_drift_before_halt,
+            "orphan_pending": dict(self._orphan_detection_count),
+            "recent_order_symbols": list(self._recent_order_symbols.keys()),
             "last_reconciliation": (
                 {
                     "timestamp": self._last_reconciliation.timestamp.isoformat(),
@@ -416,6 +505,33 @@ class PositionReconciler:
                 if self._last_reconciliation else None
             ),
             "reconciliation_count": len(self._reconciliation_history),
+        }
+
+    async def reset_halt(self) -> dict[str, Any]:
+        """Reset EMERGENCY HALT state to allow trading to resume.
+
+        Resets the consecutive drift counter and orphan detection state.
+        Should be called after investigating the root cause of the halt.
+
+        Returns:
+            Dict with reset status information
+        """
+        prev_drifts = self._consecutive_drifts
+        self._consecutive_drifts = 0
+        self._halted = False
+        self._orphan_detection_count.clear()
+        self._start_time = datetime.utcnow()  # Reset startup grace period
+
+        logger.warning(
+            f"[Reconciler] EMERGENCY HALT reset. Previous consecutive drifts: {prev_drifts}. "
+            f"Startup grace period restarted ({self._startup_grace_seconds}s)."
+        )
+
+        return {
+            "reset": True,
+            "previous_consecutive_drifts": prev_drifts,
+            "grace_period_seconds": self._startup_grace_seconds,
+            "message": "Emergency halt reset. Grace period restarted.",
         }
 
     async def force_reconcile(self) -> ReconciliationResult:

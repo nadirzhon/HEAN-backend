@@ -879,10 +879,16 @@ class ExecutionRouter:
             order_request: Order request to place
         """
         try:
+            # CRITICAL: Pre-register the placement BEFORE the HTTP call.
+            # This prevents a race condition where the WebSocket fill event
+            # arrives before place_order() returns, causing OrderManager
+            # lookup to fail and the position to not be tracked locally.
+            self._order_manager.pre_register_placement(order_request)
+
             # Place order on Bybit (leverage is enforced inside place_order)
             order = await self._bybit_http.place_order(order_request)
 
-            # Register order with order manager
+            # Register order with order manager (also clears pending placement)
             self._order_manager.register_order(order)
 
             # Publish order placed event
@@ -893,6 +899,8 @@ class ExecutionRouter:
             )
 
         except Exception as e:
+            # Clear pending placement on failure
+            self._order_manager.consume_pending_placement(order_request.symbol)
             logger.error(f"Failed to place order on Bybit: {e}", exc_info=True)
             await self._publish_order_rejected(order_request, str(e))
 

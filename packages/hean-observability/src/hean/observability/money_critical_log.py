@@ -527,9 +527,15 @@ class MoneyCriticalLog:
             Summary dictionary
         """
         recent = self.get_recent_entries(10)
+        stats = self.get_stats()
 
         return {
-            "stats": self.get_stats(),
+            # Top-level convenience fields for quick dashboard consumption
+            "total_entries": stats["total_entries"],
+            "log_file": stats["log_file"],
+            "active_chains": stats["active_chains"],
+            # Full stats block
+            "stats": stats,
             "recent_entries": [e.to_dict() for e in recent],
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -564,18 +570,36 @@ class MoneyCriticalLog:
 _money_log: MoneyCriticalLog | None = None
 
 
+def _default_money_log_dir() -> str | None:
+    """Resolve the default money log directory from config.
+
+    Returns the configured money_log_dir, or None if empty / unavailable.
+    """
+    try:
+        from hean.config import settings
+        configured = getattr(settings, "money_log_dir", "")
+        if configured:
+            return configured
+    except Exception:
+        pass
+    return None
+
+
 def get_money_log(log_dir: str | Path | None = None) -> MoneyCriticalLog:
     """Get or create global money-critical log.
 
     Args:
-        log_dir: Directory for log files
+        log_dir: Directory for log files. If None, uses the value from
+                 ``settings.money_log_dir`` (default: ``data/money_logs``).
 
     Returns:
         MoneyCriticalLog instance
     """
     global _money_log
     if _money_log is None:
-        _money_log = MoneyCriticalLog(log_dir=log_dir)
+        # Use explicit log_dir, or fall back to config default
+        effective_dir = log_dir if log_dir is not None else _default_money_log_dir()
+        _money_log = MoneyCriticalLog(log_dir=effective_dir)
     return _money_log
 
 

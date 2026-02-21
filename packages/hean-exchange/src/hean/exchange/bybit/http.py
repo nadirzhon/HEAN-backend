@@ -56,6 +56,9 @@ class BybitHTTPClient:
         self._min_request_interval = 0.05  # 50ms between any requests = 20 req/sec
         self._request_lock = asyncio.Lock()
 
+        # Server time synchronization (compensates Docker clock skew)
+        self._server_time_offset_ms: int = 0  # local_time + offset = server_time
+
         # LATENCY OPTIMIZATION: Instrument info cache (saves ~150ms per order)
         self._instrument_cache: dict[str, tuple[dict, float]] = {}  # symbol -> (info, timestamp)
         self._instrument_cache_ttl: float = 3600.0  # 1 hour TTL
@@ -159,8 +162,9 @@ class BybitHTTPClient:
         data = data or {}
 
         # Generate timestamp and recv window
-        timestamp = int(time.time() * 1000)
-        recv_window = "5000"
+        # Use server time offset if available (synced on connect)
+        timestamp = int(time.time() * 1000) + self._server_time_offset_ms
+        recv_window = "20000"  # 20s window to tolerate Docker clock skew
 
         # Create signature (v5: timestamp + apiKey + recvWindow + query/body)
         signature = self._sign_request(method, timestamp, recv_window, params, data)
@@ -268,6 +272,38 @@ class BybitHTTPClient:
         # Should not reach here, but just in case
         raise RuntimeError(f"Request failed after {max_retries} attempts")
 
+    async def sync_server_time(self) -> None:
+        """Synchronize local clock with Bybit server time.
+
+        Calculates the offset between local time and server time to prevent
+        timestamp validation errors (especially in Docker containers with clock skew).
+        """
+        try:
+            if not self._client:
+                self._client = httpx.AsyncClient(timeout=10.0)
+
+            url = f"{self._base_url}/v5/market/time"
+            response = await self._client.get(url)
+            response.raise_for_status()
+            result = response.json()
+
+            server_time_ms = int(result.get("result", {}).get("timeNano", "0")) // 1_000_000
+            if server_time_ms == 0:
+                # Fallback: some endpoints return timeSecond
+                server_time_ms = int(float(result.get("result", {}).get("timeSecond", "0")) * 1000)
+
+            if server_time_ms > 0:
+                local_time_ms = int(time.time() * 1000)
+                self._server_time_offset_ms = server_time_ms - local_time_ms
+                logger.info(
+                    f"Server time synced: offset={self._server_time_offset_ms}ms "
+                    f"(local {'behind' if self._server_time_offset_ms > 0 else 'ahead'})"
+                )
+            else:
+                logger.warning("Could not parse server time, using local clock")
+        except Exception as e:
+            logger.warning(f"Server time sync failed (using local clock): {e}")
+
     async def connect(self) -> None:
         """Connect to Bybit API."""
         if not settings.is_live:
@@ -276,6 +312,9 @@ class BybitHTTPClient:
 
         if not self._api_key or not self._api_secret:
             raise ValueError("Bybit API credentials not configured")
+
+        # Sync server time first to prevent timestamp errors
+        await self.sync_server_time()
 
         # Test connection by getting account info
         try:

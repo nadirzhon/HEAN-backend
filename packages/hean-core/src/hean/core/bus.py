@@ -74,7 +74,13 @@ _TRACE_SKIP_DISPATCH_TYPES: frozenset[EventType] = frozenset(
 )
 
 # Fast-path events that bypass the queue for minimal latency
-FAST_PATH_EVENTS = {EventType.SIGNAL, EventType.ORDER_REQUEST, EventType.ORDER_FILLED, EventType.ENRICHED_SIGNAL}
+FAST_PATH_EVENTS = {
+    EventType.SIGNAL,
+    EventType.ORDER_REQUEST,
+    EventType.ORDER_FILLED,
+    EventType.ENRICHED_SIGNAL,
+    EventType.ORDER_DECISION,
+}
 
 
 class EventPriority(Enum):
@@ -96,6 +102,8 @@ EVENT_PRIORITY_MAP: dict[EventType, EventPriority] = {
     EventType.POSITION_CLOSED: EventPriority.CRITICAL,
     EventType.RISK_ALERT: EventPriority.CRITICAL,
     EventType.ENRICHED_SIGNAL: EventPriority.CRITICAL,
+    EventType.ORDER_DECISION: EventPriority.CRITICAL,
+    EventType.ORDER_EXIT_DECISION: EventPriority.CRITICAL,
     # Normal - important but can wait
     EventType.PNL_UPDATE: EventPriority.NORMAL,
     EventType.REGIME_UPDATE: EventPriority.NORMAL,
@@ -221,6 +229,10 @@ class EventBus:
         self._priority_tasks: list[asyncio.Task[None]] = []
         self._batch_size = 10  # Process up to 10 events in a batch
         self._batch_timeout = 0.01  # 10ms timeout for batching
+        # Per-handler timeout: handlers exceeding this are cancelled to prevent
+        # a single slow handler from blocking the entire dispatch batch.
+        # 5 seconds is generous — most handlers should complete in <100ms.
+        self._handler_timeout_s: float = 5.0
 
         # CRITICAL: Thread pool for sync handlers to prevent blocking event loop
         self._executor = concurrent.futures.ThreadPoolExecutor(
@@ -577,6 +589,7 @@ class EventBus:
         Uses asyncio.Event for idle-wait instead of spawning tasks, preventing
         a 2-3 task-per-second leak when queues are empty.
         """
+        _dlq_cleanup_counter = 0
         while self._running:
             try:
                 batch: list[Event] = []
@@ -633,6 +646,20 @@ class EventBus:
                     metrics.count += 1
                     metrics.total_ms += elapsed * 1000
                     metrics.p99_window.append(elapsed)
+
+                # Periodic DLQ cleanup: clear permanently-failed entries every
+                # ~1000 batches to prevent unbounded memory growth from DLQ
+                # holding references to large Event data dicts.
+                _dlq_cleanup_counter += 1
+                if _dlq_cleanup_counter >= 1000 and self._dlq is not None:
+                    _dlq_cleanup_counter = 0
+                    cleared = self._dlq.clear(permanently_failed_only=True)
+                    if cleared > 0:
+                        logger.info(
+                            "[EventBus] DLQ cleanup: cleared %d permanently-failed "
+                            "entries to reduce GC pressure",
+                            cleared,
+                        )
 
             except asyncio.CancelledError:
                 # CRITICAL FIX: CancelledError must be re-raised, not caught
@@ -765,10 +792,24 @@ class EventBus:
         try:
             logger.debug("Calling handler %s for %s", handler_name, event.event_type)
             if asyncio.iscoroutinefunction(handler):
-                await handler(event)
+                coro = handler(event)
             else:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(self._executor, handler, event)
+                coro = loop.run_in_executor(self._executor, handler, event)
+
+            # Enforce per-handler timeout to prevent a single slow handler
+            # from blocking the entire dispatch batch for seconds.
+            try:
+                await asyncio.wait_for(coro, timeout=self._handler_timeout_s)
+            except TimeoutError:
+                elapsed_ms = (time.monotonic() - start_mono) * 1000
+                logger.error(
+                    "[EventBus] HANDLER TIMEOUT: %s exceeded %.0fs limit for %s "
+                    "(ran for %.0fms). Handler cancelled to unblock dispatch.",
+                    handler_name, self._handler_timeout_s, event.event_type,
+                    elapsed_ms,
+                )
+                raise
 
             elapsed_ms = (time.monotonic() - start_mono) * 1000
             logger.debug("Handler %s completed in %.1fms", handler_name, elapsed_ms)

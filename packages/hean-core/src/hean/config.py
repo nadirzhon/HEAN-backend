@@ -273,6 +273,28 @@ class HEANSettings(BaseSettings):
         default=2, gt=0, description="Hours to pause after consecutive losses (HEAN v2 Iron Rule: 2h)"
     )
 
+    # API-visible risk limits
+    max_daily_attempts: int = Field(
+        default=120,
+        gt=0,
+        description="Maximum daily trade attempts across all strategies (default matches impulse_max_attempts_per_day)",
+    )
+    max_exposure_usd: float = Field(
+        default=1000.0,
+        gt=0,
+        description="Maximum total notional exposure in USD",
+    )
+    min_notional_usd: float = Field(
+        default=5.0,
+        gt=0,
+        description="Minimum notional order size in USD",
+    )
+    cooldown_seconds: int = Field(
+        default=120,
+        ge=0,
+        description="Cooldown period in seconds between trades for the same strategy",
+    )
+
     # Minimum Risk:Reward Ratio (HEAN v2 Iron Rule #5)
     min_risk_reward_ratio: float = Field(
         default=2.0,
@@ -899,6 +921,13 @@ class HEANSettings(BaseSettings):
         ge=10,
         description="Maximum in-memory incident fingerprints retained by log intelligence service.",
     )
+    money_log_dir: str = Field(
+        default="data/money_logs",
+        description=(
+            "Directory for money-critical audit log files (append-only JSONL). "
+            "Set to empty string to disable file-based logging (in-memory only)."
+        ),
+    )
     health_check_port: int = Field(default=8080, gt=0, le=65535, description="Health check port")
     debug_mode: bool = Field(
         default=False,
@@ -1411,7 +1440,7 @@ class HEANSettings(BaseSettings):
         default=5.0, description="Component heartbeat interval"
     )
     archon_signal_timeout_sec: float = Field(
-        default=10.0, description="Signal stage timeout before dead-letter"
+        default=30.0, description="Signal stage timeout before dead-letter (raised from 10s to reduce false timeouts)"
     )
     archon_max_active_signals: int = Field(
         default=1000, description="Max concurrent tracked signals"

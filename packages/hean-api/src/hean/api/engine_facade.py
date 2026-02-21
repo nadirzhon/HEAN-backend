@@ -26,6 +26,7 @@ class EngineFacade:
         telemetry_service.set_engine_state(self._state)
 
         # Expose advanced systems (will be set when trading system starts)
+        self._graph_engine = None
         self._meta_learning_engine = None
         self._causal_inference_engine = None
         self._multimodal_swarm = None
@@ -66,6 +67,8 @@ class EngineFacade:
                 await self._trading_system.start()
 
                 # Expose advanced systems for API access
+                if hasattr(self._trading_system, '_graph_engine'):
+                    self._graph_engine = self._trading_system._graph_engine
                 if hasattr(self._trading_system, '_meta_learning_engine'):
                     self._meta_learning_engine = self._trading_system._meta_learning_engine
                 if hasattr(self._trading_system, '_causal_inference_engine'):
@@ -142,6 +145,7 @@ class EngineFacade:
                 telemetry_service.set_engine_state("STOPPED")
 
                 # Clear all component references to prevent stale access after stop
+                self._graph_engine = None
                 self._meta_learning_engine = None
                 self._causal_inference_engine = None
                 self._multimodal_swarm = None
@@ -362,6 +366,19 @@ class EngineFacade:
         if not self._running or self._trading_system is None:
             return {"status": "error", "message": "Engine is not running"}
         return await self._trading_system.reset_paper_state()
+
+    async def reset_reconciler_halt(self) -> dict[str, Any]:
+        """Reset the position reconciler EMERGENCY HALT state.
+
+        Clears the consecutive drift counter and stop_trading flag set by
+        the reconciler, allowing trading to resume.
+
+        Returns:
+            Dict with reset status information
+        """
+        if not self._running or self._trading_system is None:
+            return {"status": "error", "message": "Engine is not running"}
+        return await self._trading_system.reset_reconciler_halt()
 
     async def pause(self) -> dict[str, Any]:
         """Pause the trading engine (stop accepting new signals).

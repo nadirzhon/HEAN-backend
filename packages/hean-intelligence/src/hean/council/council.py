@@ -59,6 +59,7 @@ class AICouncil:
         self._members = list(DEFAULT_MEMBERS)
 
         self._client: Any | None = None
+        self._client_type: str = "openai"  # "openai" (OpenRouter/OpenAI) or "anthropic"
         self._setup_client()
 
         self._running = False
@@ -67,42 +68,91 @@ class AICouncil:
         self._all_recommendations: deque[Recommendation] = deque(maxlen=500)
 
     def _setup_client(self) -> None:
-        """Initialize AsyncOpenAI client for OpenRouter."""
-        api_key = os.getenv("OPENROUTER_API_KEY", "")
-        if not api_key:
-            try:
-                from hean.config import settings
-                api_key = settings.openrouter_api_key
-            except Exception:
-                pass
+        """Initialize AsyncOpenAI client for OpenRouter (with fallback providers).
 
-        if api_key:
+        Resolution order:
+        1. OpenRouter API key (preferred — accesses all models)
+        2. OpenAI API key (direct, gpt-4o)
+        3. Anthropic API key via anthropic SDK (Claude)
+        """
+        # --- 1. Try settings first (reads from .env), then os.getenv fallback ---
+        openrouter_key = ""
+        openai_key = ""
+        anthropic_key = ""
+
+        try:
+            from hean.config import settings as _cfg
+            openrouter_key = _cfg.openrouter_api_key or ""
+            openai_key = _cfg.openai_api_key or ""
+            anthropic_key = _cfg.anthropic_api_key or ""
+        except Exception:
+            pass
+
+        # Env vars override (higher priority for Docker/K8s secrets)
+        openrouter_key = os.getenv("OPENROUTER_API_KEY", "") or openrouter_key
+        openai_key = os.getenv("OPENAI_API_KEY", "") or openai_key
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY", "") or anthropic_key
+
+        # --- 2. Try OpenRouter (preferred — multi-model council) ---
+        if openrouter_key:
             try:
                 import openai
                 self._client = openai.AsyncOpenAI(
                     base_url="https://openrouter.ai/api/v1",
-                    api_key=api_key,
+                    api_key=openrouter_key,
                 )
                 logger.info("AI Council: OpenRouter client initialized")
+                return
+            except ImportError:
+                logger.warning("AI Council: openai package not installed, trying alternatives")
+
+        # --- 3. Try direct OpenAI ---
+        if openai_key:
+            try:
+                import openai
+                self._client = openai.AsyncOpenAI(api_key=openai_key)
+                logger.info("AI Council: OpenAI client initialized (direct)")
+                return
             except ImportError:
                 logger.warning("AI Council: openai package not installed")
-        else:
-            logger.warning("AI Council: No OPENROUTER_API_KEY, council will be inactive")
+
+        # --- 4. Try Anthropic ---
+        if anthropic_key:
+            try:
+                import anthropic
+                self._client = anthropic.AsyncAnthropic(api_key=anthropic_key)
+                self._client_type = "anthropic"
+                logger.info("AI Council: Anthropic client initialized")
+                return
+            except ImportError:
+                logger.warning("AI Council: anthropic package not installed")
+
+        logger.warning(
+            "AI Council: No API keys configured (checked OPENROUTER_API_KEY, "
+            "OPENAI_API_KEY, ANTHROPIC_API_KEY). Council will be inactive."
+        )
 
     async def start(self) -> None:
         """Start the council."""
         if self._running:
             return
         if not self._client:
-            logger.warning("AI Council: No client configured, not starting")
-            return
+            # Retry client setup — API keys may have been loaded after __init__
+            self._setup_client()
+            if not self._client:
+                logger.warning(
+                    "AI Council: No LLM client configured. Council is enabled but "
+                    "reviews will be skipped until an API key is provided "
+                    "(OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY)."
+                )
 
         self._running = True
         await self._introspector.start()
         self._task = asyncio.create_task(self._review_loop())
         logger.info(
             f"AI Council started ({len(self._members)} members, "
-            f"interval={self._review_interval}s)"
+            f"interval={self._review_interval}s, "
+            f"client={'configured' if self._client else 'NOT configured'})"
         )
 
     async def stop(self) -> None:
@@ -124,6 +174,14 @@ class AICouncil:
 
         while self._running:
             try:
+                if not self._client:
+                    # Retry client setup periodically
+                    self._setup_client()
+                    if not self._client:
+                        logger.debug("Council review skipped: no LLM client available")
+                        await asyncio.sleep(self._review_interval)
+                        continue
+
                 session = await self._run_review_session()
                 self._sessions.append(session)
                 logger.info(
@@ -484,8 +542,18 @@ class AICouncil:
         contested = sum(
             1 for r in self._all_recommendations if r.contested
         )
+
+        # Determine enabled from config, not just runtime state
+        config_enabled = True
+        try:
+            from hean.config import settings as _cfg
+            config_enabled = _cfg.council_enabled
+        except Exception:
+            pass
+
         return {
-            "enabled": self._running,
+            "enabled": config_enabled,
+            "running": self._running,
             "client_configured": self._client is not None,
             "review_interval_hours": self._review_interval / 3600,
             "auto_apply_safe": self._auto_apply_safe,

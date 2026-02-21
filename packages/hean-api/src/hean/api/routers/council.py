@@ -1,7 +1,8 @@
 """AI Council API router."""
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Query
 
@@ -35,7 +36,23 @@ async def get_council_status():
     council = _get_council()
     if council:
         return council.get_status()
-    return {"enabled": False, "message": "Council not active"}
+
+    # Council object not in facade -- check config to see if it SHOULD be enabled
+    try:
+        from hean.config import settings
+        return {
+            "enabled": settings.council_enabled,
+            "running": False,
+            "client_configured": False,
+            "total_sessions": 0,
+            "message": (
+                "Council enabled in config but not yet started. "
+                "Engine may still be initializing."
+            ),
+        }
+    except Exception:
+        pass
+    return {"enabled": False, "running": False, "client_configured": False, "total_sessions": 0}
 
 
 @router.get("/reviews")
@@ -123,3 +140,68 @@ async def get_trade_verdicts(limit: int = Query(default=20, le=100)):
     if tc:
         return tc.get_recent_verdicts(limit)
     return []
+
+
+@router.get("/history")
+async def get_council_history(
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    """Get council decision history (reviews + verdicts combined).
+
+    Returns a merged timeline of council review sessions and
+    trade council verdicts, ordered by most recent first.
+    """
+    history: list[dict[str, Any]] = []
+
+    # Council review sessions
+    council = _get_council()
+    if council and hasattr(council, "_sessions") and council._sessions:
+        for session in list(council._sessions)[-limit:]:
+            entry = session.model_dump() if hasattr(session, "model_dump") else {}
+            entry["source"] = "review_council"
+            history.append(entry)
+
+    # Trade council verdicts
+    tc = _get_trade_council()
+    if tc:
+        try:
+            verdicts = tc.get_recent_verdicts(limit)
+            if isinstance(verdicts, list):
+                for verdict in verdicts:
+                    if isinstance(verdict, dict):
+                        verdict["source"] = "trade_council"
+                        history.append(verdict)
+        except Exception as e:
+            logger.debug(f"Failed to get trade council verdicts: {e}")
+
+    # Council recommendations
+    if council:
+        try:
+            recs = council.get_all_recommendations(limit)
+            if isinstance(recs, list):
+                for rec in recs:
+                    entry = rec.model_dump() if hasattr(rec, "model_dump") else rec
+                    if isinstance(entry, dict):
+                        entry["source"] = "recommendation"
+                        history.append(entry)
+        except Exception as e:
+            logger.debug(f"Failed to get council recommendations: {e}")
+
+    # Sort by timestamp (best effort)
+    def sort_key(item: dict) -> str:
+        return (
+            item.get("timestamp")
+            or item.get("created_at")
+            or item.get("reviewed_at")
+            or ""
+        )
+
+    history.sort(key=sort_key, reverse=True)
+
+    return {
+        "history": history[:limit],
+        "count": min(len(history), limit),
+        "council_active": council is not None,
+        "trade_council_active": tc is not None,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
