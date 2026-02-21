@@ -34,3 +34,12 @@ for _pkg in _PACKAGES:
     if _src not in sys.path:
         # Insert at the front so backend packages shadow any system installs
         sys.path.insert(0, _src)
+
+# Remove conflicting HEAN-META editable install that shadows namespace packages.
+# HEAN-META has an __init__.py at src/hean/ which captures the 'hean' namespace,
+# preventing Python from discovering hean.core.*, hean.risk.*, etc. from the
+# monorepo workspace packages.
+sys.path = [p for p in sys.path if "HEAN-META" not in p]
+for _key in list(sys.modules.keys()):
+    if _key.startswith("hean"):
+        del sys.modules[_key]
